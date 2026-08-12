@@ -1,0 +1,22 @@
+.DS_Store
+.tools/
+.idea/
+
+# Local build output
+build/
+firmware/**/build/
+android-app/.gradle/
+android-app/build/
+android-app/app/build/
+
+# Machine-specific Android configuration
+android-app/local.properties
+
+# Downloaded toolchains and third-party firmware images
+xtensa-esp-elf-*.tar.gz
+circuitpython-hardware-check.bin
+
+# Embedded build artifacts
+*.elf
+*.map
+*.merged.bin
