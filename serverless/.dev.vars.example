@@ -1,0 +1,6 @@
+EMQX_API_URL="https://your-deployment.example.com:8443/api/v5"
+EMQX_APP_ID="replace-with-app-id"
+EMQX_APP_SECRET="replace-with-app-secret"
+APP_API_TOKEN="replace-with-a-random-64-character-token"
+DEVICE_ID="7CE8B1B1FC9C"
+DEVICE_COMMAND_TOPIC="devices/7CE8B1B1FC9C/commands/display"

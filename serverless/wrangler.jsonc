@@ -1,0 +1,11 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "odd-river-673a",
+  "main": "src/index.js",
+  "compatibility_date": "2026-08-13",
+  "workers_dev": true,
+  "keep_vars": true,
+  "observability": {
+    "enabled": true
+  }
+}

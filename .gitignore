@@ -20,3 +20,12 @@ circuitpython-hardware-check.bin
 *.elf
 *.map
 *.merged.bin
+
+# Cloudflare Worker local secrets and dependencies
+serverless/node_modules/
+serverless/.wrangler/
+serverless/.dev.vars
+serverless/.dev.vars.*
+serverless/.env
+serverless/.env.*
+!serverless/.dev.vars.example
