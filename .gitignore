@@ -29,3 +29,6 @@ serverless/.dev.vars.*
 serverless/.env
 serverless/.env.*
 !serverless/.dev.vars.example
+
+# Device-local MQTT credentials
+firmware/wifi_provisioning/mqtt_secrets.h

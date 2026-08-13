@@ -2,12 +2,23 @@
 #include <ArduinoJson.h>
 #include <DNSServer.h>
 #include <Preferences.h>
+#include <PubSubClient.h>
 #include <WebServer.h>
 #include <WiFi.h>
+#include <WiFiClientSecure.h>
 #include <esp_system.h>
+#include <time.h>
+
+#include "mqtt_config.h"
+
+#if __has_include("mqtt_secrets.h")
+#include "mqtt_secrets.h"
+#else
+#define MQTT_PASSWORD ""
+#endif
 
 namespace Config {
-constexpr char kFirmwareVersion[] = "0.3.2";
+constexpr char kFirmwareVersion[] = "0.4.0";
 constexpr char kDeviceModel[] = "ESP32-S3-N16R8";
 constexpr char kApiPrefix[] = "/api/v1";
 constexpr char kPreferencesNamespace[] = "wifi-prov";
@@ -46,6 +57,8 @@ enum class ProvisioningState {
 Preferences preferences;
 WebServer server(Config::kHttpPort);
 DNSServer dnsServer;
+WiFiClientSecure mqttTlsClient;
+PubSubClient mqttClient(mqttTlsClient);
 
 ProvisioningState provisioningState = ProvisioningState::kUnprovisioned;
 String deviceId;
@@ -71,6 +84,15 @@ uint32_t lastLedUpdateAt = 0;
 bool bootLongPressHandled = false;
 bool bootButtonRawPressed = false;
 bool bootButtonPressed = false;
+bool timeSyncStarted = false;
+bool mqttPasswordWarningPrinted = false;
+uint32_t lastMqttReconnectAt = 0;
+uint32_t lastTimeSyncCheckAt = 0;
+uint32_t notificationLedUntil = 0;
+String mqttCommandTopic;
+String mqttAckTopic;
+String mqttStateTopic;
+String mqttClientId;
 
 const char *stateName(ProvisioningState state) {
   switch (state) {
@@ -631,6 +653,163 @@ void processProvisioningLed() {
   rgbLedWrite(RGB_BUILTIN, 0, 0, brightness);
 }
 
+bool hasValidSystemTime() {
+  // TLS certificate validation requires a plausible wall-clock time.
+  return time(nullptr) >= 1704067200;  // 2024-01-01T00:00:00Z
+}
+
+void publishMqttState(bool online) {
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  JsonDocument document;
+  document["deviceId"] = deviceId;
+  document["online"] = online;
+  document["firmwareVersion"] = Config::kFirmwareVersion;
+  document["ip"] = online ? WiFi.localIP().toString() : "";
+  document["timestamp"] = static_cast<uint64_t>(time(nullptr)) * 1000ULL;
+  const String payload = jsonString(document);
+  mqttClient.publish(mqttStateTopic.c_str(), payload.c_str(), true);
+}
+
+void publishCommandAck(const char *messageId, const char *status, const char *errorCode = nullptr) {
+  if (!mqttClient.connected()) {
+    return;
+  }
+
+  JsonDocument document;
+  document["messageId"] = messageId;
+  document["deviceId"] = deviceId;
+  document["status"] = status;
+  document["receivedAt"] = static_cast<uint64_t>(time(nullptr)) * 1000ULL;
+  if (errorCode != nullptr) {
+    document["errorCode"] = errorCode;
+  }
+  const String payload = jsonString(document);
+  if (!mqttClient.publish(mqttAckTopic.c_str(), payload.c_str(), false)) {
+    Serial.println("[mqtt] Failed to publish command acknowledgement");
+  }
+}
+
+void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
+  if (mqttCommandTopic != topic) {
+    return;
+  }
+
+  JsonDocument document;
+  const DeserializationError error = deserializeJson(document, payload, length);
+  if (error) {
+    Serial.printf("[mqtt] Invalid command JSON: %s\n", error.c_str());
+    publishCommandAck("", "rejected", "INVALID_JSON");
+    return;
+  }
+
+  const char *messageId = document["messageId"] | "";
+  const char *targetDeviceId = document["deviceId"] | "";
+  const char *type = document["type"] | "";
+  const char *text = document["text"] | "";
+  const uint32_t displayDurationMs = document["displayDurationMs"] | 10000;
+  const uint32_t buzzerDurationMs = document["buzzerDurationMs"] | 3000;
+
+  if (messageId[0] == '\0' || strcmp(targetDeviceId, deviceId.c_str()) != 0 ||
+      strcmp(type, "display") != 0 || text[0] == '\0') {
+    Serial.println("[mqtt] Rejected command with invalid fields");
+    publishCommandAck(messageId, "rejected", "INVALID_COMMAND");
+    return;
+  }
+
+  Serial.println();
+  Serial.println("[mqtt] Display command received");
+  Serial.printf("[mqtt] Message ID: %s\n", messageId);
+  Serial.printf("[mqtt] Text: %s\n", text);
+  Serial.printf("[mqtt] Display duration: %lu ms\n", displayDurationMs);
+  Serial.printf("[mqtt] Buzzer duration: %lu ms (hardware not installed)\n", buzzerDurationMs);
+
+  // Until the OLED and buzzer arrive, serial output and a short blue flash
+  // provide a hardware-independent end-to-end confirmation.
+  if (!provisioningModeActive) {
+    rgbLedWrite(RGB_BUILTIN, 0, 0, Config::kButtonHoldLedBrightness);
+    notificationLedUntil = millis() + MqttConfig::kNotificationLedDurationMs;
+  }
+  publishCommandAck(messageId, "received");
+}
+
+void connectMqtt() {
+  if (MQTT_PASSWORD[0] == '\0') {
+    if (!mqttPasswordWarningPrinted) {
+      Serial.println("[mqtt] MQTT_PASSWORD is not configured; MQTT is disabled");
+      mqttPasswordWarningPrinted = true;
+    }
+    return;
+  }
+
+  const String offlinePayload = String("{\"deviceId\":\"") + deviceId +
+                                "\",\"online\":false}";
+  Serial.printf("[mqtt] Connecting to %s:%u\n", MqttConfig::kHost, MqttConfig::kPort);
+  const bool connected = mqttClient.connect(
+      mqttClientId.c_str(), mqttClientId.c_str(), MQTT_PASSWORD, mqttStateTopic.c_str(), 1, true,
+      offlinePayload.c_str(), true);
+  if (!connected) {
+    Serial.printf("[mqtt] Connection failed, state=%d; retrying later\n", mqttClient.state());
+    return;
+  }
+
+  Serial.println("[mqtt] TLS connection established");
+  if (!mqttClient.subscribe(mqttCommandTopic.c_str(), 1)) {
+    Serial.println("[mqtt] Failed to subscribe to command topic");
+    mqttClient.disconnect();
+    return;
+  }
+  Serial.printf("[mqtt] Subscribed: %s\n", mqttCommandTopic.c_str());
+  publishMqttState(true);
+}
+
+void processMqtt() {
+  if (WiFi.status() != WL_CONNECTED) {
+    if (mqttClient.connected()) {
+      mqttClient.disconnect();
+    }
+    timeSyncStarted = false;
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (!hasValidSystemTime()) {
+    if (!timeSyncStarted) {
+      configTime(0, 0, "pool.ntp.org", "time.cloudflare.com");
+      timeSyncStarted = true;
+      Serial.println("[time] Synchronizing clock for TLS validation");
+    }
+    if (now - lastTimeSyncCheckAt >= MqttConfig::kTimeSyncRetryIntervalMs) {
+      lastTimeSyncCheckAt = now;
+      Serial.println("[time] Waiting for NTP synchronization");
+    }
+    return;
+  }
+
+  if (!mqttClient.connected()) {
+    if (lastMqttReconnectAt == 0 || now - lastMqttReconnectAt >= MqttConfig::kReconnectIntervalMs) {
+      lastMqttReconnectAt = now;
+      connectMqtt();
+    }
+    return;
+  }
+  mqttClient.loop();
+}
+
+void processNotificationLed() {
+  if (notificationLedUntil == 0 || provisioningModeActive || bootButtonPressed) {
+    return;
+  }
+  if (static_cast<int32_t>(millis() - notificationLedUntil) >= 0) {
+    notificationLedUntil = 0;
+    if (WiFi.status() == WL_CONNECTED) {
+      rgbLedWrite(RGB_BUILTIN, 0, Config::kConnectedLedBrightness, 0);
+    }
+  }
+}
+
 void setup() {
   Serial.begin(115200);
   delay(500);
@@ -638,6 +817,15 @@ void setup() {
   rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
 
   deviceId = formatDeviceId();
+  mqttClientId = "esp32-" + deviceId;
+  mqttCommandTopic = "devices/" + deviceId + "/commands/display";
+  mqttAckTopic = "devices/" + deviceId + "/ack";
+  mqttStateTopic = "devices/" + deviceId + "/state";
+  mqttTlsClient.setCACert(MqttConfig::kCaCertificate);
+  mqttClient.setServer(MqttConfig::kHost, MqttConfig::kPort);
+  mqttClient.setCallback(handleMqttMessage);
+  mqttClient.setKeepAlive(MqttConfig::kKeepAliveSeconds);
+  mqttClient.setBufferSize(MqttConfig::kPacketBufferBytes);
   configureHttpRoutes();
   loadPersistentState();
 
@@ -651,6 +839,8 @@ void setup() {
   Serial.printf("Previously provisioned: %s\n", hasProvisionedBefore ? "yes" : "no");
   Serial.println("Hold BOOT for 5 seconds to enter provisioning mode");
   Serial.println("Press BOOT once while provisioning to stop the access point");
+  Serial.printf("MQTT command topic: %s\n", mqttCommandTopic.c_str());
+  Serial.printf("MQTT client ID: %s\n", mqttClientId.c_str());
   Serial.println("============================================");
 
   if (!savedSsid.isEmpty()) {
@@ -665,7 +855,9 @@ void setup() {
 void loop() {
   processBootButton();
   processConnectionState();
+  processMqtt();
   processProvisioningLed();
+  processNotificationLed();
 
   if (provisioningModeActive) {
     dnsServer.processNextRequest();

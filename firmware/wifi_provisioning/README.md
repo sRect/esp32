@@ -16,6 +16,9 @@
 - 进入和退出配网不会清除已保存的旧 Wi-Fi 配置。
 - 配网成功后保留热点15秒，供 App 查询最终状态，然后关闭热点。
 - 支持 Captive Portal 常见探测路径。
+- Wi-Fi 联网后通过 TLS 连接 EMQX，并自动重连。
+- 订阅设备显示命令，暂时通过串口和短暂蓝灯反馈消息。
+- 向设备 ACK 和在线状态主题发布处理结果。
 
 ## 默认配网热点
 
@@ -101,12 +104,36 @@ USB CDC On Boot: Disabled
 
 ```text
 ArduinoJson
+PubSubClient
 ```
+
+## MQTT 本地配置
+
+复制示例文件并填写该设备的 MQTT 认证密码：
+
+```text
+mqtt_secrets.h.example -> mqtt_secrets.h
+```
+
+`mqtt_secrets.h` 已加入 `.gitignore`，不得提交到 Git。固件通过 TLS 8883 端口连接
+EMQX，使用内置的 DigiCert Global Root G2 公共 CA 验证服务器证书。
+MQTT 用户名和客户端 ID 均由 `esp32-<deviceId>` 生成，当前设备为
+`esp32-7CE8B1B1FC9C`。
+
+当前主题：
+
+```text
+订阅：devices/7CE8B1B1FC9C/commands/display
+发布：devices/7CE8B1B1FC9C/ack
+发布：devices/7CE8B1B1FC9C/state
+```
+
+OLED 和蜂鸣器到货前，收到的 `text`、`displayDurationMs` 和
+`buzzerDurationMs` 会输出到 115200 波特率的串口，板载 RGB 灯短暂闪蓝后恢复暗绿色。
 
 ## 当前安全边界
 
-- SoftAP 使用按设备 ID 派生的唯一密码。
-- 修改类接口需要本次启动生成的随机 token。
+- SoftAP 是无密码开放热点，修改类接口需要每次启动随机生成的 token。
 - 日志不会输出家庭 Wi-Fi 密码。
 - Wi-Fi 密码当前由 Arduino Preferences 保存到普通 NVS。
 - 正式量产前仍需评估 NVS Encryption、Flash Encryption 和 Secure Boot。
