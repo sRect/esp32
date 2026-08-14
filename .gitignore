@@ -1,10 +1,10 @@
 .DS_Store
-.tools/
+embedded/.tools/
 .idea/
 
 # Local build output
-build/
-firmware/**/build/
+embedded/build/
+embedded/firmware/**/build/
 android-app/.gradle/
 android-app/build/
 android-app/app/build/
@@ -31,4 +31,4 @@ serverless/.env.*
 !serverless/.dev.vars.example
 
 # Device-local MQTT credentials
-firmware/wifi_provisioning/mqtt_secrets.h
+embedded/firmware/wifi_provisioning/mqtt_secrets.h

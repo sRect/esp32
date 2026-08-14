@@ -7,6 +7,9 @@ constexpr uint16_t kKeepAliveSeconds = 30;
 constexpr uint32_t kReconnectIntervalMs = 5000;
 constexpr uint32_t kTimeSyncRetryIntervalMs = 1000;
 constexpr uint32_t kNotificationLedDurationMs = 250;
+constexpr uint8_t kFailuresBeforeWifiRecovery = 6;
+constexpr uint32_t kTcpProbeTimeoutMs = 5000;
+constexpr uint32_t kTlsHandshakeTimeoutSeconds = 15;
 constexpr size_t kPacketBufferBytes = 2048;
 
 constexpr char kCaCertificate[] = R"CERT(-----BEGIN CERTIFICATE-----

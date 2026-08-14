@@ -1,6 +1,6 @@
 # ESP32 Wi-Fi 配网 Android App
 
-配套固件：`firmware/wifi_provisioning` 0.2.0 及以上。
+配套固件：`embedded/firmware/wifi_provisioning` 0.4.0 及以上。
 
 ## 技术栈
 
@@ -26,6 +26,28 @@ App 不依赖 Retrofit 等第三方网络库，设备协议使用 Android 自带
 8. 用户选择网络并输入密码。
 9. App 提交配置并轮询连接状态。
 10. 成功后释放设备网络，Android 自动恢复手机原网络。
+11. 成功页可通过 Cloudflare Worker 向设备发送文字消息。
+12. App 在本机保留最近 10 条成功发送的消息，并展示本地发送时间。
+
+设备已经联网时，也可以从 App 首页直接进入“发送文字消息”，无需重新配网或连接
+ESP32 热点。当前 OLED 和蜂鸣器尚未安装，设备收到消息后会在串口输出内容并短暂闪蓝灯。
+
+## Worker 消息接口
+
+App 使用以下 HTTPS 接口发送消息：
+
+```text
+POST https://odd-river-673a.srect2017.workers.dev/api/v1/devices/7CE8B1B1FC9C/messages
+```
+
+将 Cloudflare Worker 的 `APP_API_TOKEN` 添加到本机的 `android-app/local.properties`：
+
+```properties
+APP_API_TOKEN=替换为本地保存的Token
+```
+
+`local.properties` 已被 Git 忽略，真实 Token 不会提交到仓库。仓库中的
+`local.properties.example` 仅包含占位符。修改 Token 后需要重新构建并安装 App。
 
 ## 当前开发板默认值
 
@@ -64,3 +86,4 @@ Android 手机，选择 `app` 运行配置后点击 Run。
 - App 不写入日志、不持久化家庭 Wi-Fi 密码。
 - 修改类接口使用每次设备启动随机生成的 `X-Provisioning-Token`。
 - 当前设备 HTTP 为局域网明文传输，正式量产前仍需评估二维码密钥、应用层加密及固件安全启动。
+- 当前消息 Token 会编译进 APK，仅适合单设备原型测试；正式发布前应改为用户登录、短期访问令牌和设备归属校验。

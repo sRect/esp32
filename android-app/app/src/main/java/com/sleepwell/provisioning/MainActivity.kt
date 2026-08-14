@@ -60,6 +60,9 @@ import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.sleepwell.provisioning.data.DeviceInfo
 import com.sleepwell.provisioning.data.WifiNetwork
+import java.time.Instant
+import java.time.ZoneId
+import java.time.format.DateTimeFormatter
 
 private val Ink = Color(0xFF17221C)
 private val Forest = Color(0xFF245A42)
@@ -117,6 +120,10 @@ class MainActivity : ComponentActivity() {
                     onRouterPasswordChange = viewModel::setRouterPassword,
                     onSubmitNetwork = viewModel::submitSelectedNetwork,
                     onStartOver = viewModel::startOver,
+                    onOpenMessages = viewModel::openMessagePage,
+                    onCloseMessages = viewModel::closeMessagePage,
+                    onMessageTextChange = viewModel::setMessageText,
+                    onSendMessage = viewModel::sendMessage,
                 )
             }
         }
@@ -152,6 +159,10 @@ private fun ProvisioningApp(
     onRouterPasswordChange: (String) -> Unit,
     onSubmitNetwork: () -> Unit,
     onStartOver: () -> Unit,
+    onOpenMessages: () -> Unit,
+    onCloseMessages: () -> Unit,
+    onMessageTextChange: (String) -> Unit,
+    onSendMessage: () -> Unit,
 ) {
     Scaffold(
         containerColor = Paper,
@@ -173,7 +184,9 @@ private fun ProvisioningApp(
                 .padding(innerPadding)
                 .padding(horizontal = 20.dp),
         ) {
-            StepRail(state.page)
+            if (state.page != ProvisioningPage.MESSAGE) {
+                StepRail(state.page)
+            }
             AnimatedVisibility(state.errorMessage != null) {
                 ErrorBanner(state.errorMessage.orEmpty())
             }
@@ -184,6 +197,7 @@ private fun ProvisioningApp(
                     state,
                     onDeviceSsidChange,
                     onConnectDevice,
+                    onOpenMessages,
                 )
                 ProvisioningPage.CONNECTING_DEVICE -> LoadingPage(
                     eyebrow = "连接设备",
@@ -198,7 +212,18 @@ private fun ProvisioningApp(
                     detail = state.statusText,
                     hint = "请不要退出 App 或短按 BOOT，过程通常需要 5–20 秒。",
                 )
-                ProvisioningPage.SUCCESS -> SuccessPage(state, onStartOver)
+                ProvisioningPage.SUCCESS -> SuccessPage(
+                    state = state,
+                    onMessageTextChange = onMessageTextChange,
+                    onSendMessage = onSendMessage,
+                    onStartOver = onStartOver,
+                )
+                ProvisioningPage.MESSAGE -> MessagePage(
+                    state = state,
+                    onMessageTextChange = onMessageTextChange,
+                    onSendMessage = onSendMessage,
+                    onBack = onCloseMessages,
+                )
             }
         }
     }
@@ -230,7 +255,7 @@ private fun StepRail(page: ProvisioningPage) {
         ProvisioningPage.INTRO, ProvisioningPage.CONNECTING_DEVICE -> 0
         ProvisioningPage.WIFI_LIST -> 1
         ProvisioningPage.CONNECTING_ROUTER -> 2
-        ProvisioningPage.SUCCESS -> 3
+        ProvisioningPage.SUCCESS, ProvisioningPage.MESSAGE -> 3
     }
     Row(
         modifier = Modifier.fillMaxWidth().padding(vertical = 10.dp),
@@ -275,6 +300,7 @@ private fun IntroPage(
     state: ProvisioningUiState,
     onSsidChange: (String) -> Unit,
     onConnect: () -> Unit,
+    onOpenMessages: () -> Unit,
 ) {
     LazyColumn(verticalArrangement = Arrangement.spacedBy(14.dp)) {
         item {
@@ -317,6 +343,15 @@ private fun IntroPage(
                 lineHeight = 17.sp,
                 modifier = Modifier.padding(8.dp),
             )
+        }
+        item {
+            OutlinedButton(
+                onClick = onOpenMessages,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(16.dp),
+            ) {
+                Text("设备已联网？发送文字消息", fontWeight = FontWeight.Bold)
+            }
         }
     }
 }
@@ -493,29 +528,197 @@ private fun WifiPasswordDialog(
 }
 
 @Composable
-private fun SuccessPage(state: ProvisioningUiState, onStartOver: () -> Unit) {
-    Column(
+private fun SuccessPage(
+    state: ProvisioningUiState,
+    onMessageTextChange: (String) -> Unit,
+    onSendMessage: () -> Unit,
+    onStartOver: () -> Unit,
+) {
+    LazyColumn(
         modifier = Modifier.fillMaxSize(),
         horizontalAlignment = Alignment.CenterHorizontally,
-        verticalArrangement = Arrangement.Center,
+        verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
-        Box(Modifier.size(112.dp).background(Forest, CircleShape), contentAlignment = Alignment.Center) {
-            Text("✓", color = Color.White, fontSize = 58.sp, fontWeight = FontWeight.Light)
+        item {
+            Box(Modifier.size(82.dp).background(Forest, CircleShape), contentAlignment = Alignment.Center) {
+                Text("✓", color = Color.White, fontSize = 42.sp, fontWeight = FontWeight.Light)
+            }
         }
-        Spacer(Modifier.height(28.dp))
-        Text("连接成功", color = Ink, fontSize = 34.sp, fontWeight = FontWeight.Black)
-        Text(state.statusText, color = Forest, fontSize = 16.sp, modifier = Modifier.padding(top = 8.dp))
-        Text(
-            "手机已释放设备热点并恢复原网络。ESP32 的蓝色呼吸灯会熄灭。",
-            color = Muted,
-            fontSize = 14.sp,
-            lineHeight = 21.sp,
-            modifier = Modifier.padding(top = 20.dp, start = 24.dp, end = 24.dp),
-        )
-        OutlinedButton(
-            onClick = onStartOver,
-            modifier = Modifier.fillMaxWidth().padding(top = 30.dp).height(52.dp),
-            shape = RoundedCornerShape(15.dp),
-        ) { Text("配置另一台设备") }
+        item {
+            Column(horizontalAlignment = Alignment.CenterHorizontally) {
+                Text("连接成功", color = Ink, fontSize = 30.sp, fontWeight = FontWeight.Black)
+                Text(state.statusText, color = Forest, fontSize = 15.sp, modifier = Modifier.padding(top = 5.dp))
+            }
+        }
+        item {
+            MessageComposer(state, onMessageTextChange, onSendMessage)
+        }
+        item {
+            RecentMessages(state.recentMessages)
+        }
+        item {
+            OutlinedButton(
+                onClick = onStartOver,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(15.dp),
+            ) { Text("配置另一台设备") }
+        }
     }
 }
+
+@Composable
+private fun MessagePage(
+    state: ProvisioningUiState,
+    onMessageTextChange: (String) -> Unit,
+    onSendMessage: () -> Unit,
+    onBack: () -> Unit,
+) {
+    LazyColumn(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+        item {
+            Text("发送到设备", color = Ink, fontSize = 34.sp, fontWeight = FontWeight.Black)
+            Text(
+                "消息通过 Cloudflare Worker 和 MQTT 下发，无需连接 ESP32 热点。",
+                color = Muted,
+                fontSize = 14.sp,
+                lineHeight = 21.sp,
+                modifier = Modifier.padding(top = 8.dp),
+            )
+        }
+        item {
+            MessageComposer(state, onMessageTextChange, onSendMessage)
+        }
+        item {
+            RecentMessages(state.recentMessages)
+        }
+        item {
+            TextButton(onClick = onBack, modifier = Modifier.fillMaxWidth()) {
+                Text("返回配网页")
+            }
+        }
+    }
+}
+
+@Composable
+private fun MessageComposer(
+    state: ProvisioningUiState,
+    onMessageTextChange: (String) -> Unit,
+    onSendMessage: () -> Unit,
+) {
+    Surface(color = WarmWhite, shape = RoundedCornerShape(22.dp)) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(18.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Text("文字消息", color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Text(
+                "当前 OLED 未安装，ESP32 收到消息后会在串口输出并短暂闪蓝灯。",
+                color = Muted,
+                fontSize = 12.sp,
+                lineHeight = 18.sp,
+            )
+            OutlinedTextField(
+                value = state.messageText,
+                onValueChange = onMessageTextChange,
+                modifier = Modifier.fillMaxWidth(),
+                label = { Text("输入要显示的文字") },
+                supportingText = {
+                    Text("${state.messageText.codePointCount(0, state.messageText.length)}/120")
+                },
+                minLines = 3,
+                maxLines = 5,
+                shape = RoundedCornerShape(14.dp),
+                enabled = !state.isSendingMessage,
+            )
+            Button(
+                onClick = onSendMessage,
+                enabled = state.messageText.isNotBlank() && !state.isSendingMessage,
+                modifier = Modifier.fillMaxWidth().height(52.dp),
+                shape = RoundedCornerShape(15.dp),
+                colors = ButtonDefaults.buttonColors(containerColor = Forest),
+            ) {
+                if (state.isSendingMessage) {
+                    CircularProgressIndicator(
+                        modifier = Modifier.size(22.dp),
+                        color = Color.White,
+                        strokeWidth = 2.dp,
+                    )
+                    Spacer(Modifier.width(10.dp))
+                }
+                Text(if (state.isSendingMessage) "发送中…" else "发送到 ESP32", fontWeight = FontWeight.Bold)
+            }
+            state.messageStatus?.let { status ->
+                Text(status, color = Forest, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecentMessages(messages: List<SentMessage>) {
+    Column(
+        modifier = Modifier.fillMaxWidth(),
+        verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically,
+        ) {
+            Text("最近发送", color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.weight(1f))
+            Text("${messages.size}/10", color = Muted, fontSize = 12.sp)
+        }
+        if (messages.isEmpty()) {
+            Surface(color = Mint, shape = RoundedCornerShape(16.dp)) {
+                Text(
+                    "还没有发送记录",
+                    modifier = Modifier.fillMaxWidth().padding(16.dp),
+                    color = Muted,
+                    fontSize = 13.sp,
+                )
+            }
+        } else {
+            messages.forEach { message ->
+                RecentMessageRow(message)
+            }
+        }
+    }
+}
+
+@Composable
+private fun RecentMessageRow(message: SentMessage) {
+    Surface(color = WarmWhite, shape = RoundedCornerShape(16.dp)) {
+        Column(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 16.dp, vertical = 14.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+            Text(
+                text = message.text,
+                color = Ink,
+                fontSize = 15.sp,
+                fontWeight = FontWeight.Medium,
+                maxLines = 3,
+                overflow = TextOverflow.Ellipsis,
+            )
+            Row(modifier = Modifier.fillMaxWidth()) {
+                Text(
+                    text = formatSentTime(message.sentAtMillis),
+                    color = Muted,
+                    fontSize = 11.sp,
+                )
+                Spacer(Modifier.weight(1f))
+                Text(
+                    text = message.messageId.take(8),
+                    color = Muted,
+                    fontSize = 11.sp,
+                )
+            }
+        }
+    }
+}
+
+private val sentTimeFormatter: DateTimeFormatter = DateTimeFormatter.ofPattern("MM-dd HH:mm:ss")
+
+private fun formatSentTime(sentAtMillis: Long): String =
+    Instant.ofEpochMilli(sentAtMillis)
+        .atZone(ZoneId.systemDefault())
+        .format(sentTimeFormatter)

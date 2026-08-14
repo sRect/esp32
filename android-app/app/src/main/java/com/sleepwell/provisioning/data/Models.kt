@@ -32,3 +32,14 @@ class ProvisioningApiException(
     val code: String,
     override val message: String,
 ) : Exception(message)
+
+data class MessageDeliveryResult(
+    val messageId: String,
+    val deviceId: String,
+    val accepted: Boolean,
+)
+
+class WorkerApiException(
+    val code: String,
+    override val message: String,
+) : Exception(message)

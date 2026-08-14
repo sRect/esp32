@@ -1,8 +1,20 @@
+import java.util.Properties
+
 plugins {
     id("com.android.application")
     id("org.jetbrains.kotlin.android")
     id("org.jetbrains.kotlin.plugin.compose")
 }
+
+val localProperties = Properties().apply {
+    val localPropertiesFile = rootProject.file("local.properties")
+    if (localPropertiesFile.exists()) {
+        localPropertiesFile.inputStream().use(::load)
+    }
+}
+
+fun buildConfigString(value: String): String =
+    "\"${value.replace("\\", "\\\\").replace("\"", "\\\"")}\""
 
 android {
     namespace = "com.sleepwell.provisioning"
@@ -17,7 +29,19 @@ android {
         minSdk = 29
         targetSdk = 36
         versionCode = 3
-        versionName = "0.2.0"
+        versionName = "0.3.0"
+
+        buildConfigField(
+            "String",
+            "WORKER_BASE_URL",
+            buildConfigString("https://odd-river-673a.srect2017.workers.dev"),
+        )
+        buildConfigField(
+            "String",
+            "WORKER_API_TOKEN",
+            buildConfigString(localProperties.getProperty("APP_API_TOKEN", "")),
+        )
+        buildConfigField("String", "DEVICE_ID", buildConfigString("7CE8B1B1FC9C"))
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }

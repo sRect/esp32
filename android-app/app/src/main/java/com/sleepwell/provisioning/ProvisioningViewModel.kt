@@ -1,6 +1,7 @@
 package com.sleepwell.provisioning
 
 import android.app.Application
+import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.sleepwell.provisioning.data.DeviceInfo
@@ -8,6 +9,8 @@ import com.sleepwell.provisioning.data.Esp32Api
 import com.sleepwell.provisioning.data.EspWifiConnector
 import com.sleepwell.provisioning.data.ProvisioningApiException
 import com.sleepwell.provisioning.data.WifiNetwork
+import com.sleepwell.provisioning.data.WorkerApi
+import com.sleepwell.provisioning.data.WorkerApiException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -16,6 +19,8 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import org.json.JSONArray
+import org.json.JSONObject
 
 enum class ProvisioningPage {
     INTRO,
@@ -23,6 +28,7 @@ enum class ProvisioningPage {
     WIFI_LIST,
     CONNECTING_ROUTER,
     SUCCESS,
+    MESSAGE,
 }
 
 data class ProvisioningUiState(
@@ -36,14 +42,37 @@ data class ProvisioningUiState(
     val isRefreshing: Boolean = false,
     val statusText: String = "",
     val errorMessage: String? = null,
+    val messageText: String = "",
+    val isSendingMessage: Boolean = false,
+    val messageStatus: String? = null,
+    val recentMessages: List<SentMessage> = emptyList(),
+)
+
+data class SentMessage(
+    val messageId: String,
+    val text: String,
+    val sentAtMillis: Long,
 )
 
 class ProvisioningViewModel(application: Application) : AndroidViewModel(application) {
+    companion object {
+        private const val MESSAGE_HISTORY_PREFERENCES = "message-history"
+        private const val MESSAGE_HISTORY_KEY = "recent-messages"
+        private const val MAX_RECENT_MESSAGES = 10
+    }
+
     private val connector = EspWifiConnector(application)
+    private val workerApi = WorkerApi(BuildConfig.WORKER_BASE_URL, BuildConfig.WORKER_API_TOKEN)
+    private val messageHistoryPreferences = application.getSharedPreferences(
+        MESSAGE_HISTORY_PREFERENCES,
+        Context.MODE_PRIVATE,
+    )
     private var api: Esp32Api? = null
     private var token: String = ""
 
-    private val _uiState = MutableStateFlow(ProvisioningUiState())
+    private val _uiState = MutableStateFlow(
+        ProvisioningUiState(recentMessages = loadRecentMessages()),
+    )
     val uiState: StateFlow<ProvisioningUiState> = _uiState.asStateFlow()
 
     fun setDeviceSsid(value: String) {
@@ -52,6 +81,80 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
 
     fun setRouterPassword(value: String) {
         _uiState.update { it.copy(routerPassword = value, errorMessage = null) }
+    }
+
+    fun setMessageText(value: String) {
+        if (value.codePointCount(0, value.length) <= 120) {
+            _uiState.update {
+                it.copy(messageText = value, messageStatus = null, errorMessage = null)
+            }
+        }
+    }
+
+    fun openMessagePage() {
+        _uiState.update {
+            it.copy(
+                page = ProvisioningPage.MESSAGE,
+                messageStatus = null,
+                errorMessage = null,
+            )
+        }
+    }
+
+    fun closeMessagePage() {
+        _uiState.update {
+            it.copy(
+                page = ProvisioningPage.INTRO,
+                messageStatus = null,
+                errorMessage = null,
+            )
+        }
+    }
+
+    fun sendMessage() {
+        val text = _uiState.value.messageText.trim()
+        if (text.isEmpty()) {
+            return showMessage("请输入要发送的文字")
+        }
+        if (text.codePointCount(0, text.length) > 120) {
+            return showMessage("文字不能超过 120 个字符")
+        }
+
+        viewModelScope.launch {
+            _uiState.update {
+                it.copy(isSendingMessage = true, messageStatus = null, errorMessage = null)
+            }
+            runCatching {
+                withContext(Dispatchers.IO) {
+                    workerApi.sendDisplayMessage(BuildConfig.DEVICE_ID, text)
+                }
+            }.onSuccess { result ->
+                val recentMessages = listOf(
+                    SentMessage(
+                        messageId = result.messageId,
+                        text = text,
+                        sentAtMillis = System.currentTimeMillis(),
+                    ),
+                ) + _uiState.value.recentMessages.take(MAX_RECENT_MESSAGES - 1)
+                saveRecentMessages(recentMessages)
+                _uiState.update {
+                    it.copy(
+                        messageText = "",
+                        isSendingMessage = false,
+                        messageStatus = "发送成功 · ${result.messageId.take(8)}",
+                        recentMessages = recentMessages,
+                    )
+                }
+            }.onFailure { throwable ->
+                val message = when (throwable) {
+                    is WorkerApiException -> translateWorkerError(throwable.code, throwable.message)
+                    else -> throwable.message ?: "消息发送失败，请检查手机网络"
+                }
+                _uiState.update {
+                    it.copy(isSendingMessage = false, messageStatus = null, errorMessage = message)
+                }
+            }
+        }
     }
 
     fun permissionDenied() {
@@ -108,6 +211,7 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
             ProvisioningUiState(
                 deviceSsid = it.deviceSsid,
                 statusText = "已取消切换 Wi-Fi",
+                recentMessages = it.recentMessages,
             )
         }
     }
@@ -215,6 +319,7 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
         val current = _uiState.value
         _uiState.value = ProvisioningUiState(
             deviceSsid = current.deviceSsid,
+            recentMessages = current.recentMessages,
         )
     }
 
@@ -243,8 +348,46 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
         else -> fallback
     }
 
+    private fun translateWorkerError(code: String, fallback: String): String = when (code) {
+        "APP_API_TOKEN_MISSING" -> "App 尚未配置消息服务 Token，请检查本地构建配置"
+        "UNAUTHORIZED" -> "消息服务认证失败，请检查 App API Token"
+        "DEVICE_NOT_FOUND" -> "消息服务中没有找到这台设备"
+        "MQTT_PUBLISH_FAILED" -> "消息服务暂时无法连接 MQTT，请稍后重试"
+        else -> fallback
+    }
+
     private fun showMessage(message: String) {
         _uiState.update { it.copy(errorMessage = message) }
+    }
+
+    private fun loadRecentMessages(): List<SentMessage> = runCatching {
+        val stored = messageHistoryPreferences.getString(MESSAGE_HISTORY_KEY, null)
+            ?: return@runCatching emptyList()
+        val array = JSONArray(stored)
+        buildList {
+            for (index in 0 until minOf(array.length(), MAX_RECENT_MESSAGES)) {
+                val item = array.optJSONObject(index) ?: continue
+                val messageId = item.optString("messageId")
+                val text = item.optString("text")
+                val sentAtMillis = item.optLong("sentAtMillis")
+                if (messageId.isNotBlank() && text.isNotBlank() && sentAtMillis > 0) {
+                    add(SentMessage(messageId, text, sentAtMillis))
+                }
+            }
+        }
+    }.getOrDefault(emptyList())
+
+    private fun saveRecentMessages(messages: List<SentMessage>) {
+        val array = JSONArray()
+        messages.take(MAX_RECENT_MESSAGES).forEach { message ->
+            array.put(
+                JSONObject()
+                    .put("messageId", message.messageId)
+                    .put("text", message.text)
+                    .put("sentAtMillis", message.sentAtMillis),
+            )
+        }
+        messageHistoryPreferences.edit().putString(MESSAGE_HISTORY_KEY, array.toString()).apply()
     }
 
     override fun onCleared() {

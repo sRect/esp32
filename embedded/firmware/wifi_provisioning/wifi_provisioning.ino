@@ -18,7 +18,7 @@
 #endif
 
 namespace Config {
-constexpr char kFirmwareVersion[] = "0.4.0";
+constexpr char kFirmwareVersion[] = "0.4.1";
 constexpr char kDeviceModel[] = "ESP32-S3-N16R8";
 constexpr char kApiPrefix[] = "/api/v1";
 constexpr char kPreferencesNamespace[] = "wifi-prov";
@@ -89,6 +89,7 @@ bool mqttPasswordWarningPrinted = false;
 uint32_t lastMqttReconnectAt = 0;
 uint32_t lastTimeSyncCheckAt = 0;
 uint32_t notificationLedUntil = 0;
+uint8_t mqttConsecutiveFailures = 0;
 String mqttCommandTopic;
 String mqttAckTopic;
 String mqttStateTopic;
@@ -303,6 +304,7 @@ void beginStationConnection(const String &ssid, const String &password, bool fro
   } else {
     WiFi.mode(WIFI_STA);
   }
+  WiFi.setSleep(false);
   WiFi.disconnect(false, false);
   delay(100);
   WiFi.begin(pendingSsid.c_str(), pendingPassword.c_str());
@@ -735,6 +737,58 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
   publishCommandAck(messageId, "received");
 }
 
+void logMqttNetworkDiagnostics() {
+  Serial.printf("[mqtt] Wi-Fi status=%d, RSSI=%d dBm, free heap=%u bytes\n",
+                WiFi.status(), WiFi.RSSI(), ESP.getFreeHeap());
+  Serial.printf("[mqtt] Gateway=%s, DNS=%s, epoch=%lld\n",
+                WiFi.gatewayIP().toString().c_str(), WiFi.dnsIP().toString().c_str(),
+                static_cast<long long>(time(nullptr)));
+
+  IPAddress brokerIp;
+  if (!WiFi.hostByName(MqttConfig::kHost, brokerIp)) {
+    Serial.printf("[mqtt] DNS lookup failed for %s\n", MqttConfig::kHost);
+  } else {
+    Serial.printf("[mqtt] DNS resolved %s to %s\n", MqttConfig::kHost,
+                  brokerIp.toString().c_str());
+    constexpr uint16_t probePorts[] = {8883, 8084, 8443};
+    for (const uint16_t port : probePorts) {
+      WiFiClient tcpProbe;
+      const bool tcpReachable = tcpProbe.connect(
+          brokerIp, port, MqttConfig::kTcpProbeTimeoutMs);
+      Serial.printf("[mqtt] TCP probe %s:%u: %s\n", brokerIp.toString().c_str(),
+                    port, tcpReachable ? "reachable" : "failed");
+      tcpProbe.stop();
+    }
+  }
+
+  IPAddress cloudflareIp;
+  if (WiFi.hostByName("odd-river-673a.srect2017.workers.dev", cloudflareIp)) {
+    WiFiClient httpsProbe;
+    const bool httpsReachable = httpsProbe.connect(
+        cloudflareIp, 443, MqttConfig::kTcpProbeTimeoutMs);
+    Serial.printf("[mqtt] HTTPS control probe %s:443: %s\n",
+                  cloudflareIp.toString().c_str(),
+                  httpsReachable ? "reachable" : "failed");
+    httpsProbe.stop();
+  } else {
+    Serial.println("[mqtt] HTTPS control DNS lookup failed");
+  }
+
+  char tlsError[160] = {};
+  const int tlsErrorCode = mqttTlsClient.lastError(tlsError, sizeof(tlsError));
+  Serial.printf("[mqtt] TLS last error: %d (%s)\n", tlsErrorCode,
+                tlsError[0] == '\0' ? "no detail" : tlsError);
+}
+
+void recoverMqttNetwork() {
+  mqttConsecutiveFailures = 0;
+  mqttTlsClient.stop();
+  Serial.println("[mqtt] Reconnecting Wi-Fi after repeated MQTT failures");
+  if (!savedSsid.isEmpty()) {
+    beginStationConnection(savedSsid, savedPassword, false);
+  }
+}
+
 void connectMqtt() {
   if (MQTT_PASSWORD[0] == '\0') {
     if (!mqttPasswordWarningPrinted) {
@@ -751,10 +805,19 @@ void connectMqtt() {
       mqttClientId.c_str(), mqttClientId.c_str(), MQTT_PASSWORD, mqttStateTopic.c_str(), 1, true,
       offlinePayload.c_str(), true);
   if (!connected) {
+    mqttConsecutiveFailures++;
     Serial.printf("[mqtt] Connection failed, state=%d; retrying later\n", mqttClient.state());
+    if (mqttConsecutiveFailures == 1 ||
+        mqttConsecutiveFailures >= MqttConfig::kFailuresBeforeWifiRecovery) {
+      logMqttNetworkDiagnostics();
+    }
+    if (mqttConsecutiveFailures >= MqttConfig::kFailuresBeforeWifiRecovery) {
+      recoverMqttNetwork();
+    }
     return;
   }
 
+  mqttConsecutiveFailures = 0;
   Serial.println("[mqtt] TLS connection established");
   if (!mqttClient.subscribe(mqttCommandTopic.c_str(), 1)) {
     Serial.println("[mqtt] Failed to subscribe to command topic");
@@ -814,6 +877,7 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   pinMode(Config::kBootButtonPin, INPUT_PULLUP);
+  WiFi.setSleep(false);
   rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
 
   deviceId = formatDeviceId();
@@ -822,6 +886,7 @@ void setup() {
   mqttAckTopic = "devices/" + deviceId + "/ack";
   mqttStateTopic = "devices/" + deviceId + "/state";
   mqttTlsClient.setCACert(MqttConfig::kCaCertificate);
+  mqttTlsClient.setHandshakeTimeout(MqttConfig::kTlsHandshakeTimeoutSeconds);
   mqttClient.setServer(MqttConfig::kHost, MqttConfig::kPort);
   mqttClient.setCallback(handleMqttMessage);
   mqttClient.setKeepAlive(MqttConfig::kKeepAliveSeconds);
