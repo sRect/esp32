@@ -11,11 +11,11 @@
 
 项目目前已经跑通完整链路：Android 手机连接 ESP32 临时热点，将 2.4GHz Wi-Fi
 凭据交给设备；设备验证联网成功后才持久化配置，随后通过 TLS 连接 EMQX。手机还可以
-调用 Cloudflare Worker，由 Worker 将显示命令发布到 MQTT，ESP32 收到后通过串口、RGB
-指示灯和 ACK 主题反馈结果。
+调用 Cloudflare Worker，由 Worker 将显示命令发布到 MQTT，ESP32 收到后在 OLED 显示，
+并通过串口、RGB 指示灯和 ACK 主题反馈结果。
 
-当前使用的开发板是 `YD-ESP32-23 / ESP32-S3-N16R8`。OLED 和蜂鸣器尚未接入，
-因此消息展示暂时由串口输出和蓝灯闪烁代替，但云端到设备的消息链路已经完整闭环。
+当前使用的开发板是 `YD-ESP32-23 / ESP32-S3-N16R8`，已接入 128×64 I²C SSD1306
+OLED。固件支持常用中英文自动换行显示；蜂鸣器尚未接入。
 
 ## 项目能力
 
@@ -30,6 +30,42 @@
 - Worker 校验 Bearer Token、设备 ID、消息长度和时长，再以 QoS 1 发布 MQTT 命令。
 - 固件订阅设备专属主题，校验命令后发布 ACK 和在线状态。
 - App 在本机保存最近 10 条成功发送的消息，但不保存家庭 Wi-Fi 密码。
+
+## OLED 与 ESP32 接线
+
+本项目使用 0.96 英寸、128×64、I²C 接口的 SSD1306 OLED。屏幕排针丝印从左到右为
+`GND`、`VCC`、`SCL`、`SDA`，与 `YD-ESP32-23 / ESP32-S3-N16R8` 的接线如下：
+
+| OLED 针脚 | 当前线色 | ESP32-S3 针脚 | 作用 |
+|---|---|---|---|
+| `GND` | 黄线 | `GND` | 公共地 |
+| `VCC` | 绿线 | `3V3` | 3.3V 供电 |
+| `SCL` | 蓝线 | `GPIO9` | I²C 时钟 |
+| `SDA` | 紫线 | `GPIO8` | I²C 数据 |
+
+```text
+OLED                     YD-ESP32-23
+┌──────────┐             ┌──────────────┐
+│ GND      │────────────>│ GND          │
+│ VCC      │────────────>│ 3V3          │
+│ SCL      │────────────>│ GPIO9        │
+│ SDA      │────────────>│ GPIO8        │
+└──────────┘             └──────────────┘
+```
+
+注意事项：
+
+- 插拔杜邦线前先断开 USB 电源，避免移动接线时短路。
+- `VCC` 必须接 `3V3`，不要接 `5V`；ESP32-S3 的 GPIO 不耐受 5V 电平。
+- 本开发板上的 `GPIO8` 和 `GPIO9` 并不相邻，中间隔着 `GPIO3` 和 `GPIO46`。不要因为
+  线色或位置接近而把 SDA/SCL 插到相邻针脚。
+- 线色只代表当前这组杜邦线的实际连接，不是通用标准；以后换线时应以 OLED 和开发板
+  丝印为准。
+- 固件使用 `Wire.begin(8, 9)`，并在启动时自动探测常见 I²C 地址 `0x3C` 和 `0x3D`。
+
+设备尚未收到消息时，OLED 显示 Wi-Fi/MQTT 初始状态。收到消息后，上方最多显示 3 行
+消息，中间显示北京时间，底部保留 Wi-Fi 状态；最后一条消息会一直保留到新消息到达
+或设备重启。
 
 ## 仓库结构
 
@@ -159,7 +195,7 @@ GET http://192.168.4.1/api/v1/device
 {
   "deviceModel": "ESP32-S3-N16R8",
   "deviceId": "7CE8B1B1FC9C",
-  "firmwareVersion": "0.4.1",
+  "firmwareVersion": "0.5.1",
   "provisioningState": "awaiting_config",
   "hasProvisionedBefore": true,
   "apSsid": "esp32-c9c",
@@ -345,12 +381,14 @@ if (messageId[0] == '\0' ||
 }
 
 Serial.printf("[mqtt] Text: %s\n", text);
+showOledMessage(String(text), sentAtMs);
 rgbLedWrite(RGB_BUILTIN, 0, 0, Config::kButtonHoldLedBrightness);
 publishCommandAck(messageId, "received");
 ```
 
-在 OLED 和蜂鸣器接入之前，串口打印和 250ms 蓝灯闪烁就是端到端确认信号。之后只需在
-同一处理函数中替换为真正的显示与蜂鸣驱动，云端协议不需要变化。
+OLED 会持续显示最后一条消息及其北京时间，底部保留 Wi-Fi 状态；新消息到达时替换旧消息。
+`displayDurationMs` 为兼容协议继续保留但不再清屏。蜂鸣器接入前，`buzzerDurationMs`
+仍记录在串口日志中，云端协议不需要变化。
 
 ```mermaid
 sequenceDiagram
@@ -367,7 +405,7 @@ sequenceDiagram
     EMQX-->>Worker: 接受发布
     Worker-->>App: 202 Accepted + messageId
     EMQX->>ESP: MQTTS display command
-    ESP->>ESP: 校验、串口输出、蓝灯闪烁
+    ESP->>ESP: 校验、OLED 显示、蓝灯闪烁
     ESP->>EMQX: ACK: received
 ```
 
@@ -573,7 +611,6 @@ cd android-app && ./gradlew test
 
 ## 下一步
 
-- 接入 OLED，将 `text` 和 `displayDurationMs` 映射为真实显示任务。
 - 接入蜂鸣器，并对 `buzzerDurationMs` 设置硬件级上限。
 - 让 Worker 消费 ACK，向 App 展示“Broker 已接受”和“设备已执行”两个不同状态。
 - 从单设备固定配置升级为用户、设备绑定和动态主题 ACL。

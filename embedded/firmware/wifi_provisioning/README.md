@@ -18,7 +18,11 @@
 - 支持 Captive Portal 常见探测路径。
 - Wi-Fi 联网后通过 TLS 连接 EMQX，并自动重连。
 - MQTT 连续连接失败时输出 DNS、TCP、TLS 诊断并自动刷新 Wi-Fi 连接。
-- 订阅设备显示命令，暂时通过串口和短暂蓝灯反馈消息。
+- 自动探测 I²C SSD1306 OLED（地址 `0x3C` 或 `0x3D`）。
+- 订阅设备显示命令，在 OLED 上显示 App 发送的 UTF-8 中英文消息并自动换行。
+- 消息下方显示 Worker `sentAt` 对应的北京时间，底部固定显示 Wi-Fi 状态。
+- 最后一条消息持续显示，直到新消息替换；仅本次启动尚未收到消息时显示初始状态页。
+- 收到消息时短暂闪烁蓝灯；蜂鸣器到货前仍通过串口记录蜂鸣时长。
 - 向设备 ACK 和在线状态主题发布处理结果。
 
 ## 默认配网热点
@@ -106,7 +110,29 @@ USB CDC On Boot: Disabled
 ```text
 ArduinoJson
 PubSubClient
+U8g2
 ```
+
+## OLED 接线
+
+当前使用 0.96 英寸、128×64、I²C SSD1306 OLED。屏幕排针丝印从左到右为
+`GND`、`VCC`、`SCL`、`SDA`：
+
+| OLED 针脚 | 当前线色 | ESP32-S3 针脚 | 作用 |
+|---|---|---|---|
+| `GND` | 黄线 | `GND` | 公共地 |
+| `VCC` | 绿线 | `3V3` | 3.3V 供电 |
+| `SCL` | 蓝线 | `GPIO9` | I²C 时钟 |
+| `SDA` | 紫线 | `GPIO8` | I²C 数据 |
+
+插拔杜邦线前应先断开 USB 电源。`VCC` 不要接 `5V`，因为 ESP32-S3 GPIO 不耐受
+5V 电平。本开发板上的 `GPIO8` 和 `GPIO9` 不相邻，中间隔着 `GPIO3` 和 `GPIO46`；
+接线时应以开发板丝印为准，不要仅依赖杜邦线颜色。
+
+固件启动时依次探测 `0x3C` 和 `0x3D`，串口会输出实际检测到的地址。
+显示字体使用 U8g2 文泉驿 GB2312 字体，支持常用简体中文和英文。收到消息后，上方
+最多显示 3 行文字，中间显示北京时间，底部显示 Wi-Fi 状态。超出 128×64 可视范围
+的内容会截断；Emoji 等字体未收录字符可能无法显示。
 
 ## MQTT 本地配置
 
@@ -129,8 +155,11 @@ MQTT 用户名和客户端 ID 均由 `esp32-<deviceId>` 生成，当前设备为
 发布：devices/7CE8B1B1FC9C/state
 ```
 
-OLED 和蜂鸣器到货前，收到的 `text`、`displayDurationMs` 和
-`buzzerDurationMs` 会输出到 115200 波特率的串口，板载 RGB 灯短暂闪蓝后恢复暗绿色。
+收到消息后，`text` 和发送日期时间会立即显示在 OLED 上，最后一条消息持续保留，
+直到下一条消息替换。底部固定显示 `WiFi connected`、`WiFi connecting`、
+`WiFi provisioning` 或 `WiFi offline`。`displayDurationMs` 为兼容现有协议继续接收，
+但不再用于清屏。`buzzerDurationMs` 仍会输出到 115200 波特率串口，待蜂鸣器接入后
+再驱动实际硬件。板载 RGB 灯会短暂闪蓝后恢复暗绿色。
 
 ## 当前安全边界
 

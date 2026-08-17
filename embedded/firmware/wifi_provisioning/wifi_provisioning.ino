@@ -3,7 +3,9 @@
 #include <DNSServer.h>
 #include <Preferences.h>
 #include <PubSubClient.h>
+#include <U8g2lib.h>
 #include <WebServer.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <WiFiClientSecure.h>
 #include <esp_system.h>
@@ -18,7 +20,7 @@
 #endif
 
 namespace Config {
-constexpr char kFirmwareVersion[] = "0.4.1";
+constexpr char kFirmwareVersion[] = "0.5.1";
 constexpr char kDeviceModel[] = "ESP32-S3-N16R8";
 constexpr char kApiPrefix[] = "/api/v1";
 constexpr char kPreferencesNamespace[] = "wifi-prov";
@@ -40,6 +42,14 @@ constexpr uint8_t kLedMaximumBrightness = 64;
 constexpr uint8_t kConnectedLedBrightness = 8;
 constexpr uint8_t kButtonHoldLedBrightness = 8;
 constexpr uint8_t kBootButtonPin = 0;
+constexpr uint8_t kOledSdaPin = 8;
+constexpr uint8_t kOledSclPin = 9;
+constexpr uint8_t kOledPrimaryAddress = 0x3C;
+constexpr uint8_t kOledSecondaryAddress = 0x3D;
+constexpr uint8_t kOledMessageLineCount = 3;
+constexpr uint8_t kOledMessageLineHeight = 13;
+constexpr uint32_t kOledStatusRefreshIntervalMs = 500;
+constexpr int32_t kChinaUtcOffsetSeconds = 8 * 60 * 60;
 constexpr size_t kMaxRequestBodyBytes = 768;
 constexpr size_t kMaxSsidBytes = 32;
 constexpr size_t kMaxPasswordBytes = 63;
@@ -59,6 +69,7 @@ WebServer server(Config::kHttpPort);
 DNSServer dnsServer;
 WiFiClientSecure mqttTlsClient;
 PubSubClient mqttClient(mqttTlsClient);
+U8G2_SSD1306_128X64_NONAME_F_HW_I2C oled(U8G2_R0, U8X8_PIN_NONE);
 
 ProvisioningState provisioningState = ProvisioningState::kUnprovisioned;
 String deviceId;
@@ -89,7 +100,14 @@ bool mqttPasswordWarningPrinted = false;
 uint32_t lastMqttReconnectAt = 0;
 uint32_t lastTimeSyncCheckAt = 0;
 uint32_t notificationLedUntil = 0;
+uint32_t lastOledStatusRefreshAt = 0;
 uint8_t mqttConsecutiveFailures = 0;
+uint8_t oledAddress = 0;
+bool oledAvailable = false;
+bool oledHasMessage = false;
+String lastOledStatusSignature;
+String oledLastMessage;
+uint64_t oledLastMessageSentAtMs = 0;
 String mqttCommandTopic;
 String mqttAckTopic;
 String mqttStateTopic;
@@ -174,6 +192,219 @@ String makeProvisioningToken() {
   }
   value[32] = '\0';
   return String(value);
+}
+
+bool isI2cDevicePresent(uint8_t address) {
+  Wire.beginTransmission(address);
+  return Wire.endTransmission() == 0;
+}
+
+void initializeOled() {
+  Wire.begin(Config::kOledSdaPin, Config::kOledSclPin);
+  Wire.setClock(400000);
+
+  if (isI2cDevicePresent(Config::kOledPrimaryAddress)) {
+    oledAddress = Config::kOledPrimaryAddress;
+  } else if (isI2cDevicePresent(Config::kOledSecondaryAddress)) {
+    oledAddress = Config::kOledSecondaryAddress;
+  } else {
+    Serial.printf("[oled] SSD1306 not found on GPIO%u/GPIO%u (checked 0x%02X and 0x%02X)\n",
+                  Config::kOledSdaPin, Config::kOledSclPin,
+                  Config::kOledPrimaryAddress, Config::kOledSecondaryAddress);
+    return;
+  }
+
+  oled.setI2CAddress(oledAddress << 1);
+  oled.begin();
+  oled.setPowerSave(0);
+  oled.setFontMode(1);
+  oled.setFontDirection(0);
+  oled.setFontPosTop();
+  oledAvailable = true;
+
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_wqy12_t_gb2312);
+  oled.drawUTF8(0, 2, "ESP32 启动中...");
+  oled.setFont(u8g2_font_5x7_tr);
+  oled.drawStr(0, 24, "OLED: SSD1306 128x64");
+  oled.drawStr(0, 36, "SDA: GPIO8  SCL: GPIO9");
+  oled.sendBuffer();
+  Serial.printf("[oled] SSD1306 initialized at I2C address 0x%02X\n", oledAddress);
+}
+
+size_t utf8CharacterLength(uint8_t firstByte) {
+  if ((firstByte & 0x80) == 0) {
+    return 1;
+  }
+  if ((firstByte & 0xE0) == 0xC0) {
+    return 2;
+  }
+  if ((firstByte & 0xF0) == 0xE0) {
+    return 3;
+  }
+  if ((firstByte & 0xF8) == 0xF0) {
+    return 4;
+  }
+  return 1;
+}
+
+String formatOledMessageTime(uint64_t sentAtMs) {
+  if (sentAtMs == 0) {
+    return "Time unavailable";
+  }
+
+  // Worker timestamps are Unix milliseconds (UTC). This device is used in
+  // China, so render the user-facing time in UTC+8 without depending on the
+  // process-wide TZ setting used by TLS/NTP.
+  const time_t localEpoch = static_cast<time_t>(sentAtMs / 1000ULL) +
+                            Config::kChinaUtcOffsetSeconds;
+  struct tm timeInfo = {};
+  gmtime_r(&localEpoch, &timeInfo);
+  char value[20];
+  snprintf(value, sizeof(value), "%04d-%02d-%02d %02d:%02d",
+           timeInfo.tm_year + 1900, timeInfo.tm_mon + 1, timeInfo.tm_mday,
+           timeInfo.tm_hour, timeInfo.tm_min);
+  return String(value);
+}
+
+const char *oledWifiFooter() {
+  if (provisioningModeActive) {
+    return "WiFi provisioning";
+  }
+  if (provisioningState == ProvisioningState::kConnecting) {
+    return "WiFi connecting";
+  }
+  return WiFi.status() == WL_CONNECTED ? "WiFi connected" : "WiFi offline";
+}
+
+void renderOledMessage() {
+  if (!oledAvailable) {
+    return;
+  }
+
+  oled.clearBuffer();
+  oled.setFont(u8g2_font_wqy12_t_gb2312);
+  oled.setFontPosTop();
+
+  String line;
+  const char *cursor = oledLastMessage.c_str();
+  uint8_t lineIndex = 0;
+  while (*cursor != '\0' && lineIndex < Config::kOledMessageLineCount) {
+    if (*cursor == '\r') {
+      ++cursor;
+      continue;
+    }
+    if (*cursor == '\n') {
+      oled.drawUTF8(0, lineIndex * Config::kOledMessageLineHeight, line.c_str());
+      line = "";
+      ++lineIndex;
+      ++cursor;
+      continue;
+    }
+
+    size_t characterLength = utf8CharacterLength(static_cast<uint8_t>(*cursor));
+    const size_t remainingLength = strlen(cursor);
+    if (characterLength > remainingLength) {
+      characterLength = 1;
+    }
+    String character;
+    for (size_t index = 0; index < characterLength; ++index) {
+      character += cursor[index];
+    }
+
+    const String candidate = line + character;
+    if (!line.isEmpty() && oled.getUTF8Width(candidate.c_str()) > oled.getDisplayWidth()) {
+      oled.drawUTF8(0, lineIndex * Config::kOledMessageLineHeight, line.c_str());
+      line = character;
+      ++lineIndex;
+    } else {
+      line = candidate;
+    }
+    cursor += characterLength;
+  }
+
+  if (lineIndex < Config::kOledMessageLineCount && !line.isEmpty()) {
+    oled.drawUTF8(0, lineIndex * Config::kOledMessageLineHeight, line.c_str());
+  }
+
+  oled.setFont(u8g2_font_5x7_tr);
+  oled.drawStr(0, 41, formatOledMessageTime(oledLastMessageSentAtMs).c_str());
+  oled.drawHLine(0, 51, oled.getDisplayWidth());
+  oled.drawStr(0, 55, oledWifiFooter());
+  oled.sendBuffer();
+}
+
+void showOledMessage(const String &message, uint64_t sentAtMs) {
+  oledLastMessage = message;
+  oledLastMessageSentAtMs = sentAtMs;
+  oledHasMessage = true;
+  lastOledStatusSignature = "";
+  renderOledMessage();
+  Serial.printf("[oled] Last message displayed persistently at %s\n",
+                formatOledMessageTime(sentAtMs).c_str());
+}
+
+String oledStatusSignature() {
+  if (provisioningModeActive) {
+    return "provisioning:" + apSsid;
+  }
+  if (provisioningState == ProvisioningState::kConnecting) {
+    return "wifi-connecting:" + pendingSsid;
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    return hasProvisionedBefore ? "wifi-offline" : "unprovisioned";
+  }
+  return String("online:") + (mqttClient.connected() ? "mqtt" : "wifi") + ":" +
+         WiFi.localIP().toString();
+}
+
+void drawOledStatus() {
+  if (!oledAvailable) {
+    return;
+  }
+
+  oled.clearBuffer();
+  oled.setFontPosTop();
+  oled.setFont(u8g2_font_wqy12_t_gb2312);
+  oled.drawUTF8(0, 0, "ESP32 消息设备");
+
+  if (provisioningModeActive) {
+    oled.drawUTF8(0, 16, "配网模式");
+    oled.setFont(u8g2_font_5x7_tr);
+    oled.drawStr(0, 34, apSsid.c_str());
+    oled.drawStr(0, 46, "192.168.4.1");
+  } else if (provisioningState == ProvisioningState::kConnecting) {
+    oled.drawUTF8(0, 18, "正在连接 WiFi...");
+  } else if (WiFi.status() == WL_CONNECTED) {
+    oled.drawUTF8(0, 16, mqttClient.connected() ? "设备在线，等待消息" : "WiFi 已连接");
+    oled.setFont(u8g2_font_5x7_tr);
+    oled.drawStr(0, 34, WiFi.localIP().toString().c_str());
+    oled.drawStr(0, 46, mqttClient.connected() ? "MQTT: connected" : "MQTT: connecting...");
+  } else {
+    oled.drawUTF8(0, 18, hasProvisionedBefore ? "WiFi 已断开" : "长按 BOOT 配网");
+  }
+  oled.sendBuffer();
+}
+
+void processOled() {
+  if (!oledAvailable) {
+    return;
+  }
+
+  const uint32_t now = millis();
+  if (now - lastOledStatusRefreshAt < Config::kOledStatusRefreshIntervalMs) {
+    return;
+  }
+  lastOledStatusRefreshAt = now;
+  const String signature = oledStatusSignature();
+  if (signature != lastOledStatusSignature) {
+    lastOledStatusSignature = signature;
+    if (oledHasMessage) {
+      renderOledMessage();
+    } else {
+      drawOledStatus();
+    }
+  }
 }
 
 const char *authModeName(wifi_auth_mode_t mode) {
@@ -713,6 +944,10 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
   const char *text = document["text"] | "";
   const uint32_t displayDurationMs = document["displayDurationMs"] | 10000;
   const uint32_t buzzerDurationMs = document["buzzerDurationMs"] | 3000;
+  uint64_t sentAtMs = document["sentAt"].as<uint64_t>();
+  if (sentAtMs == 0 && hasValidSystemTime()) {
+    sentAtMs = static_cast<uint64_t>(time(nullptr)) * 1000ULL;
+  }
 
   if (messageId[0] == '\0' || strcmp(targetDeviceId, deviceId.c_str()) != 0 ||
       strcmp(type, "display") != 0 || text[0] == '\0') {
@@ -727,9 +962,15 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
   Serial.printf("[mqtt] Text: %s\n", text);
   Serial.printf("[mqtt] Display duration: %lu ms\n", displayDurationMs);
   Serial.printf("[mqtt] Buzzer duration: %lu ms (hardware not installed)\n", buzzerDurationMs);
+  Serial.printf("[mqtt] Sent at: %llu\n", sentAtMs);
 
-  // Until the OLED and buzzer arrive, serial output and a short blue flash
-  // provide a hardware-independent end-to-end confirmation.
+  // The latest message remains visible until another message replaces it.
+  // displayDurationMs stays in the protocol for compatibility but no longer
+  // clears the OLED.
+  showOledMessage(String(text), sentAtMs);
+
+  // The buzzer is not installed yet. A short blue flash accompanies the OLED
+  // update and provides an additional visible notification.
   if (!provisioningModeActive) {
     rgbLedWrite(RGB_BUILTIN, 0, 0, Config::kButtonHoldLedBrightness);
     notificationLedUntil = millis() + MqttConfig::kNotificationLedDurationMs;
@@ -879,6 +1120,7 @@ void setup() {
   pinMode(Config::kBootButtonPin, INPUT_PULLUP);
   WiFi.setSleep(false);
   rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
+  initializeOled();
 
   deviceId = formatDeviceId();
   mqttClientId = "esp32-" + deviceId;
@@ -906,6 +1148,7 @@ void setup() {
   Serial.println("Press BOOT once while provisioning to stop the access point");
   Serial.printf("MQTT command topic: %s\n", mqttCommandTopic.c_str());
   Serial.printf("MQTT client ID: %s\n", mqttClientId.c_str());
+  Serial.printf("OLED: %s\n", oledAvailable ? "SSD1306 ready" : "not detected");
   Serial.println("============================================");
 
   if (!savedSsid.isEmpty()) {
@@ -923,6 +1166,7 @@ void loop() {
   processMqtt();
   processProvisioningLed();
   processNotificationLed();
+  processOled();
 
   if (provisioningModeActive) {
     dnsServer.processNextRequest();
