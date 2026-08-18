@@ -50,6 +50,7 @@ constexpr uint16_t kBuzzerGapDurationMs = 100;
 constexpr uint32_t kMaxBuzzerDurationMs = 10000;
 constexpr uint8_t kOledPrimaryAddress = 0x3C;
 constexpr uint8_t kOledSecondaryAddress = 0x3D;
+constexpr uint8_t kOledTopInset = 2;
 constexpr uint8_t kOledMessageLineCount = 3;
 constexpr uint8_t kOledMessageLineHeight = 13;
 constexpr uint32_t kOledStatusRefreshIntervalMs = 500;
@@ -363,7 +364,8 @@ void renderOledMessage() {
       continue;
     }
     if (*cursor == '\n') {
-      oled.drawUTF8(0, lineIndex * Config::kOledMessageLineHeight, line.c_str());
+      oled.drawUTF8(0, Config::kOledTopInset + lineIndex * Config::kOledMessageLineHeight,
+                    line.c_str());
       line = "";
       ++lineIndex;
       ++cursor;
@@ -382,7 +384,8 @@ void renderOledMessage() {
 
     const String candidate = line + character;
     if (!line.isEmpty() && oled.getUTF8Width(candidate.c_str()) > oled.getDisplayWidth()) {
-      oled.drawUTF8(0, lineIndex * Config::kOledMessageLineHeight, line.c_str());
+      oled.drawUTF8(0, Config::kOledTopInset + lineIndex * Config::kOledMessageLineHeight,
+                    line.c_str());
       line = character;
       ++lineIndex;
     } else {
@@ -392,13 +395,14 @@ void renderOledMessage() {
   }
 
   if (lineIndex < Config::kOledMessageLineCount && !line.isEmpty()) {
-    oled.drawUTF8(0, lineIndex * Config::kOledMessageLineHeight, line.c_str());
+    oled.drawUTF8(0, Config::kOledTopInset + lineIndex * Config::kOledMessageLineHeight,
+                  line.c_str());
   }
 
   oled.setFont(u8g2_font_5x7_tr);
-  oled.drawStr(0, 41, formatOledMessageTime(oledLastMessageSentAtMs).c_str());
-  oled.drawHLine(0, 51, oled.getDisplayWidth());
-  oled.drawStr(0, 55, oledWifiFooter());
+  oled.drawStr(0, 43, formatOledMessageTime(oledLastMessageSentAtMs).c_str());
+  oled.drawHLine(0, 53, oled.getDisplayWidth());
+  oled.drawStr(0, 57, oledWifiFooter());
   oled.sendBuffer();
 }
 
@@ -434,7 +438,7 @@ void drawOledStatus() {
   oled.clearBuffer();
   oled.setFontPosTop();
   oled.setFont(u8g2_font_wqy12_t_gb2312);
-  oled.drawUTF8(0, 0, "ESP32 消息设备");
+  oled.drawUTF8(0, Config::kOledTopInset, "ESP32 消息设备");
 
   if (provisioningModeActive) {
     oled.drawUTF8(0, 16, "配网模式");
