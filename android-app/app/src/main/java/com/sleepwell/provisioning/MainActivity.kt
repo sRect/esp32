@@ -611,7 +611,7 @@ private fun MessageComposer(
         ) {
             Text("文字消息", color = Ink, fontSize = 20.sp, fontWeight = FontWeight.Bold)
             Text(
-                "当前 OLED 未安装，ESP32 收到消息后会在串口输出并短暂闪蓝灯。",
+                "ESP32 收到消息后会更新 OLED、发出两声短促蜂鸣并短暂闪蓝灯。",
                 color = Muted,
                 fontSize = 12.sp,
                 lineHeight = 18.sp,

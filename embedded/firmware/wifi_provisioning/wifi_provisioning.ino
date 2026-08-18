@@ -20,7 +20,7 @@
 #endif
 
 namespace Config {
-constexpr char kFirmwareVersion[] = "0.5.1";
+constexpr char kFirmwareVersion[] = "0.5.2";
 constexpr char kDeviceModel[] = "ESP32-S3-N16R8";
 constexpr char kApiPrefix[] = "/api/v1";
 constexpr char kPreferencesNamespace[] = "wifi-prov";
@@ -42,8 +42,12 @@ constexpr uint8_t kLedMaximumBrightness = 64;
 constexpr uint8_t kConnectedLedBrightness = 8;
 constexpr uint8_t kButtonHoldLedBrightness = 8;
 constexpr uint8_t kBootButtonPin = 0;
+constexpr uint8_t kBuzzerPin = 4;
 constexpr uint8_t kOledSdaPin = 8;
 constexpr uint8_t kOledSclPin = 9;
+constexpr uint16_t kBuzzerBeepDurationMs = 120;
+constexpr uint16_t kBuzzerGapDurationMs = 100;
+constexpr uint32_t kMaxBuzzerDurationMs = 10000;
 constexpr uint8_t kOledPrimaryAddress = 0x3C;
 constexpr uint8_t kOledSecondaryAddress = 0x3D;
 constexpr uint8_t kOledMessageLineCount = 3;
@@ -62,6 +66,13 @@ enum class ProvisioningState {
   kConnected,
   kFailed,
   kResetting,
+};
+
+enum class BuzzerPhase {
+  kIdle,
+  kFirstBeep,
+  kGap,
+  kSecondBeep,
 };
 
 Preferences preferences;
@@ -100,6 +111,9 @@ bool mqttPasswordWarningPrinted = false;
 uint32_t lastMqttReconnectAt = 0;
 uint32_t lastTimeSyncCheckAt = 0;
 uint32_t notificationLedUntil = 0;
+uint32_t buzzerPhaseEndsAt = 0;
+uint16_t buzzerSecondBeepDurationMs = 0;
+BuzzerPhase buzzerPhase = BuzzerPhase::kIdle;
 uint32_t lastOledStatusRefreshAt = 0;
 uint8_t mqttConsecutiveFailures = 0;
 uint8_t oledAddress = 0;
@@ -112,6 +126,60 @@ String mqttCommandTopic;
 String mqttAckTopic;
 String mqttStateTopic;
 String mqttClientId;
+
+void setBuzzer(bool enabled) {
+  digitalWrite(Config::kBuzzerPin, enabled ? HIGH : LOW);
+}
+
+void startBuzzerNotification(uint32_t requestedDurationMs) {
+  setBuzzer(false);
+  buzzerPhase = BuzzerPhase::kIdle;
+  buzzerPhaseEndsAt = 0;
+  buzzerSecondBeepDurationMs = 0;
+
+  const uint32_t safeDurationMs = min(requestedDurationMs, Config::kMaxBuzzerDurationMs);
+  const uint16_t audibleDurationMs =
+      min(safeDurationMs, static_cast<uint32_t>(Config::kBuzzerBeepDurationMs * 2));
+  if (audibleDurationMs == 0) {
+    return;
+  }
+
+  const uint16_t firstBeepDurationMs = (audibleDurationMs + 1) / 2;
+  buzzerSecondBeepDurationMs = audibleDurationMs / 2;
+  setBuzzer(true);
+  buzzerPhase = BuzzerPhase::kFirstBeep;
+  buzzerPhaseEndsAt = millis() + firstBeepDurationMs;
+}
+
+void processBuzzer() {
+  if (buzzerPhase == BuzzerPhase::kIdle ||
+      static_cast<int32_t>(millis() - buzzerPhaseEndsAt) < 0) {
+    return;
+  }
+
+  switch (buzzerPhase) {
+    case BuzzerPhase::kFirstBeep:
+      setBuzzer(false);
+      if (buzzerSecondBeepDurationMs == 0) {
+        buzzerPhase = BuzzerPhase::kIdle;
+      } else {
+        buzzerPhase = BuzzerPhase::kGap;
+        buzzerPhaseEndsAt = millis() + Config::kBuzzerGapDurationMs;
+      }
+      break;
+    case BuzzerPhase::kGap:
+      setBuzzer(true);
+      buzzerPhase = BuzzerPhase::kSecondBeep;
+      buzzerPhaseEndsAt = millis() + buzzerSecondBeepDurationMs;
+      break;
+    case BuzzerPhase::kSecondBeep:
+      setBuzzer(false);
+      buzzerPhase = BuzzerPhase::kIdle;
+      break;
+    case BuzzerPhase::kIdle:
+      break;
+  }
+}
 
 const char *stateName(ProvisioningState state) {
   switch (state) {
@@ -961,16 +1029,16 @@ void handleMqttMessage(char *topic, byte *payload, unsigned int length) {
   Serial.printf("[mqtt] Message ID: %s\n", messageId);
   Serial.printf("[mqtt] Text: %s\n", text);
   Serial.printf("[mqtt] Display duration: %lu ms\n", displayDurationMs);
-  Serial.printf("[mqtt] Buzzer duration: %lu ms (hardware not installed)\n", buzzerDurationMs);
+  Serial.printf("[mqtt] Buzzer duration budget: %lu ms\n", buzzerDurationMs);
   Serial.printf("[mqtt] Sent at: %llu\n", sentAtMs);
 
   // The latest message remains visible until another message replaces it.
   // displayDurationMs stays in the protocol for compatibility but no longer
   // clears the OLED.
   showOledMessage(String(text), sentAtMs);
+  startBuzzerNotification(buzzerDurationMs);
 
-  // The buzzer is not installed yet. A short blue flash accompanies the OLED
-  // update and provides an additional visible notification.
+  // A short blue flash accompanies the audible notification.
   if (!provisioningModeActive) {
     rgbLedWrite(RGB_BUILTIN, 0, 0, Config::kButtonHoldLedBrightness);
     notificationLedUntil = millis() + MqttConfig::kNotificationLedDurationMs;
@@ -1118,6 +1186,8 @@ void setup() {
   Serial.begin(115200);
   delay(500);
   pinMode(Config::kBootButtonPin, INPUT_PULLUP);
+  digitalWrite(Config::kBuzzerPin, LOW);
+  pinMode(Config::kBuzzerPin, OUTPUT);
   WiFi.setSleep(false);
   rgbLedWrite(RGB_BUILTIN, 0, 0, 0);
   initializeOled();
@@ -1149,6 +1219,7 @@ void setup() {
   Serial.printf("MQTT command topic: %s\n", mqttCommandTopic.c_str());
   Serial.printf("MQTT client ID: %s\n", mqttClientId.c_str());
   Serial.printf("OLED: %s\n", oledAvailable ? "SSD1306 ready" : "not detected");
+  Serial.printf("Buzzer: GPIO%u, high-level trigger\n", Config::kBuzzerPin);
   Serial.println("============================================");
 
   if (!savedSsid.isEmpty()) {
@@ -1166,6 +1237,7 @@ void loop() {
   processMqtt();
   processProvisioningLed();
   processNotificationLed();
+  processBuzzer();
   processOled();
 
   if (provisioningModeActive) {
