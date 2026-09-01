@@ -123,6 +123,7 @@ class MainActivity : ComponentActivity() {
                     onOpenMessages = viewModel::openMessagePage,
                     onCloseMessages = viewModel::closeMessagePage,
                     onMessageTextChange = viewModel::setMessageText,
+                    onMessageDeliveryChannelChange = viewModel::setMessageDeliveryChannel,
                     onSendMessage = viewModel::sendMessage,
                 )
             }
@@ -162,6 +163,7 @@ private fun ProvisioningApp(
     onOpenMessages: () -> Unit,
     onCloseMessages: () -> Unit,
     onMessageTextChange: (String) -> Unit,
+    onMessageDeliveryChannelChange: (MessageDeliveryChannel) -> Unit,
     onSendMessage: () -> Unit,
 ) {
     Scaffold(
@@ -215,12 +217,14 @@ private fun ProvisioningApp(
                 ProvisioningPage.SUCCESS -> SuccessPage(
                     state = state,
                     onMessageTextChange = onMessageTextChange,
+                    onMessageDeliveryChannelChange = onMessageDeliveryChannelChange,
                     onSendMessage = onSendMessage,
                     onStartOver = onStartOver,
                 )
                 ProvisioningPage.MESSAGE -> MessagePage(
                     state = state,
                     onMessageTextChange = onMessageTextChange,
+                    onMessageDeliveryChannelChange = onMessageDeliveryChannelChange,
                     onSendMessage = onSendMessage,
                     onBack = onCloseMessages,
                 )
@@ -531,6 +535,7 @@ private fun WifiPasswordDialog(
 private fun SuccessPage(
     state: ProvisioningUiState,
     onMessageTextChange: (String) -> Unit,
+    onMessageDeliveryChannelChange: (MessageDeliveryChannel) -> Unit,
     onSendMessage: () -> Unit,
     onStartOver: () -> Unit,
 ) {
@@ -551,7 +556,12 @@ private fun SuccessPage(
             }
         }
         item {
-            MessageComposer(state, onMessageTextChange, onSendMessage)
+            MessageComposer(
+                state,
+                onMessageTextChange,
+                onMessageDeliveryChannelChange,
+                onSendMessage,
+            )
         }
         item {
             RecentMessages(state.recentMessages)
@@ -570,6 +580,7 @@ private fun SuccessPage(
 private fun MessagePage(
     state: ProvisioningUiState,
     onMessageTextChange: (String) -> Unit,
+    onMessageDeliveryChannelChange: (MessageDeliveryChannel) -> Unit,
     onSendMessage: () -> Unit,
     onBack: () -> Unit,
 ) {
@@ -577,7 +588,12 @@ private fun MessagePage(
         item {
             Text("发送到设备", color = Ink, fontSize = 34.sp, fontWeight = FontWeight.Black)
             Text(
-                "消息通过 Cloudflare Worker 和 MQTT 下发，无需连接 ESP32 热点。",
+                when (state.messageDeliveryChannel) {
+                    MessageDeliveryChannel.CLOUDFLARE_WORKER ->
+                        "默认通过 Cloudflare Worker 和 MQTT 实时下发，无需连接 ESP32 热点。"
+                    MessageDeliveryChannel.GITHUB_ACTIONS ->
+                        "备用路径会先触发 GitHub Actions，Runner 启动后再发布到 MQTT。"
+                },
                 color = Muted,
                 fontSize = 14.sp,
                 lineHeight = 21.sp,
@@ -585,7 +601,12 @@ private fun MessagePage(
             )
         }
         item {
-            MessageComposer(state, onMessageTextChange, onSendMessage)
+            MessageComposer(
+                state,
+                onMessageTextChange,
+                onMessageDeliveryChannelChange,
+                onSendMessage,
+            )
         }
         item {
             RecentMessages(state.recentMessages)
@@ -602,6 +623,7 @@ private fun MessagePage(
 private fun MessageComposer(
     state: ProvisioningUiState,
     onMessageTextChange: (String) -> Unit,
+    onMessageDeliveryChannelChange: (MessageDeliveryChannel) -> Unit,
     onSendMessage: () -> Unit,
 ) {
     Surface(color = WarmWhite, shape = RoundedCornerShape(22.dp)) {
@@ -615,6 +637,38 @@ private fun MessageComposer(
                 color = Muted,
                 fontSize = 12.sp,
                 lineHeight = 18.sp,
+            )
+            Text("发送路径", color = Ink, fontSize = 13.sp, fontWeight = FontWeight.Bold)
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(10.dp),
+            ) {
+                DeliveryChannelButton(
+                    text = "Cloudflare",
+                    selected = state.messageDeliveryChannel == MessageDeliveryChannel.CLOUDFLARE_WORKER,
+                    enabled = !state.isSendingMessage,
+                    modifier = Modifier.weight(1f),
+                    onClick = {
+                        onMessageDeliveryChannelChange(MessageDeliveryChannel.CLOUDFLARE_WORKER)
+                    },
+                )
+                DeliveryChannelButton(
+                    text = "GitHub Actions",
+                    selected = state.messageDeliveryChannel == MessageDeliveryChannel.GITHUB_ACTIONS,
+                    enabled = !state.isSendingMessage,
+                    modifier = Modifier.weight(1f),
+                    onClick = {
+                        onMessageDeliveryChannelChange(MessageDeliveryChannel.GITHUB_ACTIONS)
+                    },
+                )
+            }
+            Text(
+                when (state.messageDeliveryChannel) {
+                    MessageDeliveryChannel.CLOUDFLARE_WORKER -> "推荐 · 实时发送并等待 Broker 接受"
+                    MessageDeliveryChannel.GITHUB_ACTIONS -> "备用 · 会有 Actions 排队和启动延迟"
+                },
+                color = Muted,
+                fontSize = 12.sp,
             )
             OutlinedTextField(
                 value = state.messageText,
@@ -644,11 +698,49 @@ private fun MessageComposer(
                     )
                     Spacer(Modifier.width(10.dp))
                 }
-                Text(if (state.isSendingMessage) "发送中…" else "发送到 ESP32", fontWeight = FontWeight.Bold)
+                Text(
+                    when {
+                        state.isSendingMessage -> "发送中…"
+                        state.messageDeliveryChannel == MessageDeliveryChannel.GITHUB_ACTIONS ->
+                            "通过 GitHub Actions 发送"
+                        else -> "发送到 ESP32"
+                    },
+                    fontWeight = FontWeight.Bold,
+                )
             }
             state.messageStatus?.let { status ->
                 Text(status, color = Forest, fontSize = 13.sp, fontWeight = FontWeight.Bold)
             }
+        }
+    }
+}
+
+@Composable
+private fun DeliveryChannelButton(
+    text: String,
+    selected: Boolean,
+    enabled: Boolean,
+    modifier: Modifier = Modifier,
+    onClick: () -> Unit,
+) {
+    if (selected) {
+        Button(
+            onClick = onClick,
+            enabled = enabled,
+            modifier = modifier.height(44.dp),
+            shape = RoundedCornerShape(12.dp),
+            colors = ButtonDefaults.buttonColors(containerColor = Forest),
+        ) {
+            Text(text, fontSize = 12.sp, maxLines = 1)
+        }
+    } else {
+        OutlinedButton(
+            onClick = onClick,
+            enabled = enabled,
+            modifier = modifier.height(44.dp),
+            shape = RoundedCornerShape(12.dp),
+        ) {
+            Text(text, fontSize = 12.sp, maxLines = 1)
         }
     }
 }

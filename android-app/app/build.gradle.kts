@@ -41,6 +41,23 @@ android {
             "WORKER_API_TOKEN",
             buildConfigString(localProperties.getProperty("APP_API_TOKEN", "")),
         )
+        buildConfigField("String", "GITHUB_ACTIONS_OWNER", buildConfigString("sRect"))
+        buildConfigField("String", "GITHUB_ACTIONS_REPOSITORY", buildConfigString("esp32"))
+        buildConfigField(
+            "String",
+            "GITHUB_ACTIONS_WORKFLOW",
+            buildConfigString("send-esp32-message.yml"),
+        )
+        buildConfigField(
+            "String",
+            "GITHUB_ACTIONS_REF",
+            buildConfigString(localProperties.getProperty("GITHUB_ACTIONS_REF", "feature/initial-project")),
+        )
+        buildConfigField(
+            "String",
+            "GITHUB_ACTIONS_TOKEN",
+            buildConfigString(localProperties.getProperty("GITHUB_ACTIONS_TOKEN", "")),
+        )
         buildConfigField("String", "DEVICE_ID", buildConfigString("7CE8B1B1FC9C"))
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"

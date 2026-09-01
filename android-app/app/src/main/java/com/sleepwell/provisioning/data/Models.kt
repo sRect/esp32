@@ -43,3 +43,8 @@ class WorkerApiException(
     val code: String,
     override val message: String,
 ) : Exception(message)
+
+class GitHubActionsApiException(
+    val code: String,
+    override val message: String,
+) : Exception(message)

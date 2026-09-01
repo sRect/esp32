@@ -7,6 +7,8 @@ import androidx.lifecycle.viewModelScope
 import com.sleepwell.provisioning.data.DeviceInfo
 import com.sleepwell.provisioning.data.Esp32Api
 import com.sleepwell.provisioning.data.EspWifiConnector
+import com.sleepwell.provisioning.data.GitHubActionsApi
+import com.sleepwell.provisioning.data.GitHubActionsApiException
 import com.sleepwell.provisioning.data.ProvisioningApiException
 import com.sleepwell.provisioning.data.WifiNetwork
 import com.sleepwell.provisioning.data.WorkerApi
@@ -21,6 +23,7 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import org.json.JSONArray
 import org.json.JSONObject
+import java.util.UUID
 
 enum class ProvisioningPage {
     INTRO,
@@ -29,6 +32,11 @@ enum class ProvisioningPage {
     CONNECTING_ROUTER,
     SUCCESS,
     MESSAGE,
+}
+
+enum class MessageDeliveryChannel {
+    CLOUDFLARE_WORKER,
+    GITHUB_ACTIONS,
 }
 
 data class ProvisioningUiState(
@@ -43,6 +51,7 @@ data class ProvisioningUiState(
     val statusText: String = "",
     val errorMessage: String? = null,
     val messageText: String = "",
+    val messageDeliveryChannel: MessageDeliveryChannel = MessageDeliveryChannel.CLOUDFLARE_WORKER,
     val isSendingMessage: Boolean = false,
     val messageStatus: String? = null,
     val recentMessages: List<SentMessage> = emptyList(),
@@ -63,6 +72,13 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
 
     private val connector = EspWifiConnector(application)
     private val workerApi = WorkerApi(BuildConfig.WORKER_BASE_URL, BuildConfig.WORKER_API_TOKEN)
+    private val githubActionsApi = GitHubActionsApi(
+        owner = BuildConfig.GITHUB_ACTIONS_OWNER,
+        repository = BuildConfig.GITHUB_ACTIONS_REPOSITORY,
+        workflowFile = BuildConfig.GITHUB_ACTIONS_WORKFLOW,
+        ref = BuildConfig.GITHUB_ACTIONS_REF,
+        token = BuildConfig.GITHUB_ACTIONS_TOKEN,
+    )
     private val messageHistoryPreferences = application.getSharedPreferences(
         MESSAGE_HISTORY_PREFERENCES,
         Context.MODE_PRIVATE,
@@ -91,6 +107,17 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    fun setMessageDeliveryChannel(channel: MessageDeliveryChannel) {
+        if (_uiState.value.isSendingMessage) return
+        _uiState.update {
+            it.copy(
+                messageDeliveryChannel = channel,
+                messageStatus = null,
+                errorMessage = null,
+            )
+        }
+    }
+
     fun openMessagePage() {
         _uiState.update {
             it.copy(
@@ -112,7 +139,8 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun sendMessage() {
-        val text = _uiState.value.messageText.trim()
+        val current = _uiState.value
+        val text = current.messageText.trim()
         if (text.isEmpty()) {
             return showMessage("请输入要发送的文字")
         }
@@ -126,7 +154,19 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
             }
             runCatching {
                 withContext(Dispatchers.IO) {
-                    workerApi.sendDisplayMessage(BuildConfig.DEVICE_ID, text)
+                    when (current.messageDeliveryChannel) {
+                        MessageDeliveryChannel.CLOUDFLARE_WORKER ->
+                            workerApi.sendDisplayMessage(BuildConfig.DEVICE_ID, text)
+                        MessageDeliveryChannel.GITHUB_ACTIONS -> {
+                            val now = System.currentTimeMillis()
+                            githubActionsApi.dispatchDisplayMessage(
+                                messageId = UUID.randomUUID().toString(),
+                                deviceId = BuildConfig.DEVICE_ID,
+                                text = text,
+                                sentAtMillis = now,
+                            )
+                        }
+                    }
                 }
             }.onSuccess { result ->
                 val recentMessages = listOf(
@@ -141,13 +181,20 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
                     it.copy(
                         messageText = "",
                         isSendingMessage = false,
-                        messageStatus = "发送成功 · ${result.messageId.take(8)}",
+                        messageStatus = when (current.messageDeliveryChannel) {
+                            MessageDeliveryChannel.CLOUDFLARE_WORKER ->
+                                "发送成功 · ${result.messageId.take(8)}"
+                            MessageDeliveryChannel.GITHUB_ACTIONS ->
+                                "已提交到 GitHub Actions 队列 · ${result.messageId.take(8)}"
+                        },
                         recentMessages = recentMessages,
                     )
                 }
             }.onFailure { throwable ->
                 val message = when (throwable) {
                     is WorkerApiException -> translateWorkerError(throwable.code, throwable.message)
+                    is GitHubActionsApiException ->
+                        translateGitHubActionsError(throwable.code, throwable.message)
                     else -> throwable.message ?: "消息发送失败，请检查手机网络"
                 }
                 _uiState.update {
@@ -353,6 +400,16 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
         "UNAUTHORIZED" -> "消息服务认证失败，请检查 App API Token"
         "DEVICE_NOT_FOUND" -> "消息服务中没有找到这台设备"
         "MQTT_PUBLISH_FAILED" -> "消息服务暂时无法连接 MQTT，请稍后重试"
+        else -> fallback
+    }
+
+    private fun translateGitHubActionsError(code: String, fallback: String): String = when (code) {
+        "GITHUB_TOKEN_MISSING" -> "App 尚未配置 GitHub Actions Token，请检查本地构建配置"
+        "GITHUB_CONFIG_MISSING" -> "GitHub Actions 发送配置不完整"
+        "GITHUB_HTTP_401" -> "GitHub Token 无效或已经过期"
+        "GITHUB_HTTP_403" -> "GitHub Token 没有 Actions 写入权限"
+        "GITHUB_HTTP_404" -> "没有找到 GitHub 工作流，请确认它已存在于默认分支"
+        "GITHUB_HTTP_422" -> "GitHub 工作流分支或输入配置不正确"
         else -> fallback
     }
 

@@ -26,7 +26,8 @@ App 不依赖 Retrofit 等第三方网络库，设备协议使用 Android 自带
 8. 用户选择网络并输入密码。
 9. App 提交配置并轮询连接状态。
 10. 成功后释放设备网络，Android 自动恢复手机原网络。
-11. 成功页可通过 Cloudflare Worker 向设备发送文字消息。
+11. 成功页默认通过 Cloudflare Worker 向设备发送文字消息，也可手动切换到 GitHub Actions
+    备用路径。
 12. App 在本机保留最近 10 条成功发送的消息，并展示本地发送时间。
 
 设备已经联网时，也可以从 App 首页直接进入“发送文字消息”，无需重新配网或连接
@@ -48,6 +49,33 @@ APP_API_TOKEN=替换为本地保存的Token
 
 `local.properties` 已被 Git 忽略，真实 Token 不会提交到仓库。仓库中的
 `local.properties.example` 仅包含占位符。修改 Token 后需要重新构建并安装 App。
+
+## GitHub Actions 备用消息路径
+
+发送页可以手动切换到 `GitHub Actions`。App 不创建分支，也不生成空提交，而是调用
+GitHub 的 `workflow_dispatch` API 触发 `.github/workflows/send-esp32-message.yml`。工作流
+启动后使用 EMQX HTTP API 把同样的 QoS 1、非 retained 命令发布到 ESP32 的 MQTT 主题。
+
+先将工作流提交到 GitHub 仓库的默认分支，然后在仓库的 Actions Secrets 中配置：
+
+```text
+ESP32_DEVICE_ID
+EMQX_API_URL
+EMQX_APP_ID
+EMQX_APP_SECRET
+```
+
+再创建一个只允许访问 `sRect/esp32`、仅授予 `Actions: write` 仓库权限的 fine-grained
+GitHub Token，并写入本机 `android-app/local.properties`：
+
+```properties
+GITHUB_ACTIONS_TOKEN=替换为本机保存的细粒度Token
+GITHUB_ACTIONS_REF=feature/initial-project
+```
+
+如果仓库默认分支以后改为 `main`，将 `GITHUB_ACTIONS_REF` 改成实际分支名。GitHub Token 会被
+编译进 APK，因此该路径只适合作为个人原型的备用通道；不要把带有该 Token 的 APK 对外
+发布。GitHub API 接受请求仅表示工作流进入队列，不代表 MQTT 已发布或 ESP32 已执行。
 
 ## 当前开发板默认值
 
@@ -87,3 +115,4 @@ Android 手机，选择 `app` 运行配置后点击 Run。
 - 修改类接口使用每次设备启动随机生成的 `X-Provisioning-Token`。
 - 当前设备 HTTP 为局域网明文传输，正式量产前仍需评估二维码密钥、应用层加密及固件安全启动。
 - 当前消息 Token 会编译进 APK，仅适合单设备原型测试；正式发布前应改为用户登录、短期访问令牌和设备归属校验。
+- GitHub Actions Token 同样会编译进 APK，即使使用最小权限也只能用于个人测试构建。

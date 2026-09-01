@@ -382,6 +382,24 @@ await fetch(`${env.EMQX_API_URL}/publish`, {
 这里选择 `retain: false`，是为了避免设备离线后重新连接时把一条旧的临时显示命令当成
 新消息再次执行。QoS 1 则让 Broker 至少确认一次消息投递。
 
+### GitHub Actions 备用发送路径
+
+Android 发送页可以从默认的 Cloudflare Worker 手动切换到 GitHub Actions：
+
+```text
+Android → GitHub workflow_dispatch → GitHub Actions → EMQX HTTP API → MQTT → ESP32
+```
+
+该路径不创建临时分支、不产生空提交。App 直接触发
+`.github/workflows/send-esp32-message.yml`，工作流校验设备 ID、UUID、文字和时长后发布
+MQTT 命令。它适合 Worker 故障时的个人备用发送和链路诊断，但 Actions 存在排队及 Runner
+启动延迟，不能提供实时发送保证。
+
+GitHub 仓库需要配置 `ESP32_DEVICE_ID`、`EMQX_API_URL`、`EMQX_APP_ID`、
+`EMQX_APP_SECRET` 四个 Actions Secret。Android 本机的 `local.properties` 需要配置
+`GITHUB_ACTIONS_TOKEN` 和 `GITHUB_ACTIONS_REF`；Token 必须限制到当前仓库并且只授予
+Actions 写权限。
+
 ### 3. ESP32 通过 TLS 接收命令
 
 ESP32 在获取可信系统时间后，使用 DigiCert Global Root G2 CA 校验 EMQX 证书，并通过
