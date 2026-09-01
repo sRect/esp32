@@ -1,6 +1,7 @@
 # ESP32-S3：从手机配网到云端 MQTT 消息下发
 
-> 一个覆盖嵌入式固件、Android App、Cloudflare Worker 和 EMQX Cloud 的端到端 IoT 原型。
+> 一个覆盖嵌入式固件、Android App、Cloudflare Worker、GitHub Actions 和 EMQX Cloud
+> 的端到端 IoT 原型。
 
 ![ESP32-S3 配网与消息链路](docs/images/iot-provisioning-flow.png)
 
@@ -11,8 +12,9 @@
 
 项目目前已经跑通完整链路：Android 手机连接 ESP32 临时热点，将 2.4GHz Wi-Fi
 凭据交给设备；设备验证联网成功后才持久化配置，随后通过 TLS 连接 EMQX。手机还可以
-调用 Cloudflare Worker，由 Worker 将显示命令发布到 MQTT，ESP32 收到后在 OLED 显示，
-并通过串口、RGB 指示灯和 ACK 主题反馈结果。
+默认调用 Cloudflare Worker，也可以手动切换到 GitHub Actions 备用路径。两条路径最终都
+通过 EMQX 将显示命令发布到 MQTT；ESP32 收到后在 OLED 显示，并通过串口、RGB 指示灯
+和 ACK 主题反馈结果。
 
 当前使用的开发板是 `YD-ESP32-23 / ESP32-S3-N16R8`，已接入 128×64 I²C SSD1306
 OLED 和高电平触发有源蜂鸣器。固件支持常用中英文自动换行显示，新消息到达时会发出
@@ -29,6 +31,8 @@ OLED 和高电平触发有源蜂鸣器。固件支持常用中英文自动换行
 - ESP32 使用 TLS 8883 端口连接 EMQX，并支持自动重连和网络诊断。
 - Android 通过 Cloudflare Worker 发送消息，无需再次连接 ESP32 热点。
 - Worker 校验 Bearer Token、设备 ID、消息长度和时长，再以 QoS 1 发布 MQTT 命令。
+- Android 可手动切换到 GitHub Actions，由 `workflow_dispatch` 触发备用 MQTT 发布链路。
+- GitHub Actions 发送不创建临时分支或空提交，EMQX 凭据只保存在 Actions Secrets。
 - 固件订阅设备专属主题，校验命令后发布 ACK 和在线状态。
 - App 在本机保存最近 10 条成功发送的消息，但不保存家庭 Wi-Fi 密码。
 
@@ -96,6 +100,7 @@ OLED                     YD-ESP32-23
 
 ```text
 .
+├── .github/workflows/              # GitHub Actions 备用消息下发工作流
 ├── android-app/                    # Kotlin + Jetpack Compose 配网与消息 App
 ├── embedded/
 │   ├── firmware/wifi_provisioning/ # ESP32-S3 Arduino 固件
@@ -108,13 +113,14 @@ OLED                     YD-ESP32-23
 └── docs/images/                    # README 插画
 ```
 
-四个主要边界各自承担一种职责：
+五个主要边界各自承担一种职责：
 
 | 模块 | 运行位置 | 职责 |
 |---|---|---|
 | `android-app` | Android 手机 | 引导配网、调用本地设备 API、发送云端消息 |
 | `embedded` | ESP32-S3 | SoftAP、HTTP API、NVS、Wi-Fi 状态机、MQTT 客户端 |
 | `serverless` | Cloudflare Workers | 公网 API、鉴权、参数校验、调用 EMQX HTTP API |
+| `.github/workflows` | GitHub Actions | 备用触发入口、参数校验、调用 EMQX HTTP API |
 | `mqtt` / EMQX | MQTT Broker | 将云端命令路由到指定设备，并承载 ACK 与在线状态 |
 
 ## 整体架构
@@ -137,7 +143,9 @@ flowchart LR
 
     subgraph Cloud["阶段二：云端消息"]
         A -->|"HTTPS + Bearer Token"| W["Cloudflare Worker"]
+        A -->|"手动切换：workflow_dispatch"| G["GitHub Actions"]
         W -->|"EMQX HTTP API / QoS 1"| M["EMQX Cloud"]
+        G -->|"EMQX HTTP API / QoS 1"| M
         M -->|"MQTTS :8883"| ESP
         ESP -->|"ACK / State"| M
     end
@@ -327,8 +335,9 @@ sequenceDiagram
 
 ## 第二阶段：从 App 向设备发送消息
 
-完成配网后，手机和 ESP32 不需要在同一个局域网。App 通过 HTTPS 调用 Worker，Worker
-再通过 EMQX 的 HTTP API 发布 MQTT 命令。
+完成配网后，手机和 ESP32 不需要在同一个局域网。App 默认通过 HTTPS 调用 Worker；当
+用户手动选择备用路径时，App 改为触发 GitHub Actions。两条路径最终都通过 EMQX 的
+HTTP API 发布 MQTT 命令。
 
 ### 1. Android 调用 Worker
 
@@ -382,7 +391,7 @@ await fetch(`${env.EMQX_API_URL}/publish`, {
 这里选择 `retain: false`，是为了避免设备离线后重新连接时把一条旧的临时显示命令当成
 新消息再次执行。QoS 1 则让 Broker 至少确认一次消息投递。
 
-### GitHub Actions 备用发送路径
+### 3. GitHub Actions 备用发送路径
 
 Android 发送页可以从默认的 Cloudflare Worker 手动切换到 GitHub Actions：
 
@@ -400,7 +409,10 @@ GitHub 仓库需要配置 `ESP32_DEVICE_ID`、`EMQX_API_URL`、`EMQX_APP_ID`、
 `GITHUB_ACTIONS_TOKEN` 和 `GITHUB_ACTIONS_REF`；Token 必须限制到当前仓库并且只授予
 Actions 写权限。
 
-### 3. ESP32 通过 TLS 接收命令
+GitHub 接受触发请求只表示工作流已经进入队列。由于 Runner 可能需要排队和启动，App 会
+显示“已提交到 GitHub Actions 队列”，而不是立即宣称设备已收到消息。
+
+### 4. ESP32 通过 TLS 接收命令
 
 ESP32 在获取可信系统时间后，使用 DigiCert Global Root G2 CA 校验 EMQX 证书，并通过
 8883 端口建立 TLS 连接。客户端 ID 和用户名均由设备 ID 派生：
@@ -438,15 +450,24 @@ sequenceDiagram
     actor User as 用户
     participant App as Android App
     participant Worker as Cloudflare Worker
+    participant Actions as GitHub Actions
     participant EMQX as EMQX Cloud
     participant ESP as ESP32-S3
 
     User->>App: 输入文字并发送
-    App->>Worker: HTTPS POST + Bearer Token
-    Worker->>Worker: 鉴权、校验、生成 messageId
-    Worker->>EMQX: HTTP API 发布 QoS 1 消息
-    EMQX-->>Worker: 接受发布
-    Worker-->>App: 202 Accepted + messageId
+    alt 默认路径：Cloudflare Worker
+        App->>Worker: HTTPS POST + Bearer Token
+        Worker->>Worker: 鉴权、校验、生成 messageId
+        Worker->>EMQX: HTTP API 发布 QoS 1 消息
+        EMQX-->>Worker: 接受发布
+        Worker-->>App: 202 Accepted + messageId
+    else 备用路径：GitHub Actions
+        App->>Actions: workflow_dispatch + inputs
+        Actions-->>App: 已进入工作流队列
+        Actions->>Actions: 启动 Runner 并校验参数
+        Actions->>EMQX: HTTP API 发布 QoS 1 消息
+        EMQX-->>Actions: 接受发布
+    end
     EMQX->>ESP: MQTTS display command
     ESP->>ESP: 校验、OLED 显示、蓝灯闪烁
     ESP->>EMQX: ACK: received
@@ -554,13 +575,34 @@ npm run deploy
 `wrangler.jsonc` 开启了 `keep_vars`，部署代码时不会删除 Cloudflare 控制台中已有的变量和
 Secret。
 
-### 3. 构建 Android App
+### 3. 配置 GitHub Actions 备用路径
+
+仓库设置路径：`Settings → Secrets and variables → Actions`。创建以下 Repository
+Secrets：
+
+| 名称 | 用途 |
+|---|---|
+| `ESP32_DEVICE_ID` | 允许发送的目标设备 ID |
+| `EMQX_API_URL` | EMQX v5 HTTP API 地址，末尾不包含 `/publish` |
+| `EMQX_APP_ID` | EMQX API Key |
+| `EMQX_APP_SECRET` | EMQX API Secret |
+
+工作流文件为 `.github/workflows/send-esp32-message.yml`。它必须存在于 GitHub 仓库的
+默认分支，App 才能通过 GitHub API 触发。每次发送只创建一条 Actions workflow run，
+不会创建分支或 commit。
+
+为 Android 创建只允许访问当前仓库、仅授予 `Actions: write` 权限的 fine-grained
+GitHub Token。该 Token 不得提交到仓库。
+
+### 4. 构建 Android App
 
 在 Android Studio 中打开 `android-app/`，安装 Android SDK 36，使用 JDK 17。让
 Android Studio 生成 `android-app/local.properties` 后，在其中追加：
 
 ```properties
 APP_API_TOKEN=与Cloudflare中一致的Token
+GITHUB_ACTIONS_TOKEN=仅限当前仓库且具有Actions写权限的Token
+GITHUB_ACTIONS_REF=feature/initial-project
 ```
 
 不要覆盖 Android Studio 写入的 `sdk.dir`。`local.properties` 已被 Git 忽略，仓库只保留
@@ -590,6 +632,8 @@ Wi-Fi 配网必须使用真机验证：模拟器无法可靠测试附近 Wi-Fi�
 | 错误配置覆盖可用凭据 | 联网并取得 IP 后才写 NVS | 增加双分区配置、回滚计数和恢复策略 |
 | Worker 被未授权调用 | Bearer Token + 设备 ID + 输入校验 | 用户登录、短期令牌、设备归属和限流 |
 | Token 被逆向 APK 获取 | Token 仅存本机配置但会编译进 APK | 不在客户端保存长期共享秘密 |
+| GitHub Token 被逆向 APK 获取 | Token 限定单仓库且仅有 Actions 写权限 | 用服务端签发短期令牌，不在 App 内嵌 PAT |
+| Actions 输入被恶意构造 | 工作流重新校验设备 ID、UUID、文字和时长 | 增加用户鉴权、审计与触发限流 |
 | MQTT 被窃听或冒充 | TLS CA 校验、设备独立账号和主题 | 每设备证书、最小 ACL、密钥轮换 |
 | 固件被篡改 | 当前尚未启用硬件安全能力 | Secure Boot、Flash Encryption、签名 OTA |
 
@@ -625,6 +669,15 @@ Wi-Fi 配网必须使用真机验证：模拟器无法可靠测试附近 Wi-Fi�
 - `401 UNAUTHORIZED`：检查 App 与 Cloudflare 中的 `APP_API_TOKEN` 是否一致，并重新构建 App。
 - `404 DEVICE_NOT_FOUND`：检查 App、Worker 和 ESP32 使用的设备 ID。
 - `502 MQTT_PUBLISH_FAILED`：检查 EMQX API 地址、App ID、Secret 和 ACL。
+
+### GitHub Actions 备用发送失败
+
+- App 返回 `401`：检查 `GITHUB_ACTIONS_TOKEN` 是否有效，并在修改后重新构建 APK。
+- App 返回 `403`：确认 fine-grained Token 对当前仓库具有 `Actions: write` 权限。
+- App 返回 `404`：确认工作流已推送到默认分支，文件名为 `send-esp32-message.yml`。
+- App 返回 `422`：确认 `GITHUB_ACTIONS_REF` 指向仓库中存在的分支。
+- 工作流启动后失败：检查仓库的四个 Actions Secret，以及 EMQX API 地址和 ACL。
+- App 显示已进入队列但设备暂未响应：在仓库 `Actions` 页面查看 Runner 是否仍在排队。
 
 ### ESP32 已联网但收不到 MQTT
 
