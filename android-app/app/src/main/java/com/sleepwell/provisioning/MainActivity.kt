@@ -4,6 +4,7 @@ import android.Manifest
 import android.content.pm.PackageManager
 import android.os.Build
 import android.os.Bundle
+import androidx.activity.compose.BackHandler
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.compose.setContent
@@ -81,7 +82,14 @@ class MainActivity : ComponentActivity() {
         setContent {
             ProvisioningTheme {
                 val state by viewModel.uiState.collectAsStateWithLifecycle()
-                val permissions = if (Build.VERSION.SDK_INT >= 33) {
+                BackHandler(enabled = state.page != ProvisioningPage.INTRO && state.page != ProvisioningPage.MESSAGE) {
+                    viewModel.startOver()
+                }
+                val permissions = if (state.useBluetooth && Build.VERSION.SDK_INT >= 31) {
+                    arrayOf(Manifest.permission.BLUETOOTH_SCAN, Manifest.permission.BLUETOOTH_CONNECT)
+                } else if (state.useBluetooth) {
+                    arrayOf(Manifest.permission.ACCESS_FINE_LOCATION)
+                } else if (Build.VERSION.SDK_INT >= 33) {
                     arrayOf(Manifest.permission.NEARBY_WIFI_DEVICES)
                 } else {
                     arrayOf(
@@ -102,6 +110,7 @@ class MainActivity : ComponentActivity() {
                 ProvisioningApp(
                     state = state,
                     onDeviceSsidChange = viewModel::setDeviceSsid,
+                    onTransportChange = viewModel::setUseBluetooth,
                     onConnectDevice = {
                         if (permissions.all {
                                 ContextCompat.checkSelfPermission(this, it) == PackageManager.PERMISSION_GRANTED
@@ -151,6 +160,7 @@ private fun ProvisioningTheme(content: @Composable () -> Unit) {
 private fun ProvisioningApp(
     state: ProvisioningUiState,
     onDeviceSsidChange: (String) -> Unit,
+    onTransportChange: (Boolean) -> Unit,
     onConnectDevice: () -> Unit,
     onConfirmSwitch: () -> Unit,
     onCancelSwitch: () -> Unit,
@@ -192,20 +202,24 @@ private fun ProvisioningApp(
             AnimatedVisibility(state.errorMessage != null) {
                 ErrorBanner(state.errorMessage.orEmpty())
             }
+            if (state.page in listOf(ProvisioningPage.CONNECTING_DEVICE, ProvisioningPage.WIFI_LIST, ProvisioningPage.CONNECTING_ROUTER)) {
+                TextButton(onClick = onStartOver) { Text("取消配网 / 返回首页") }
+            }
             Spacer(Modifier.height(12.dp))
 
             when (state.page) {
                 ProvisioningPage.INTRO -> IntroPage(
                     state,
                     onDeviceSsidChange,
+                    onTransportChange,
                     onConnectDevice,
                     onOpenMessages,
                 )
                 ProvisioningPage.CONNECTING_DEVICE -> LoadingPage(
                     eyebrow = "连接设备",
-                    title = "请在系统弹窗中确认",
+                    title = if (state.useBluetooth) "正在连接蓝牙设备" else "请在系统弹窗中确认",
                     detail = state.statusText,
-                    hint = "ESP32 热点没有互联网，这是正常现象。请保持连接。",
+                    hint = if (state.useBluetooth) "请保持蓝牙开启并靠近设备，无需切换手机 Wi-Fi。" else "ESP32 热点没有互联网，这是正常现象。请保持连接。",
                 )
                 ProvisioningPage.WIFI_LIST -> WifiListPage(state, onRefresh, onSelectNetwork)
                 ProvisioningPage.CONNECTING_ROUTER -> LoadingPage(
@@ -303,6 +317,7 @@ private fun ErrorBanner(message: String) {
 private fun IntroPage(
     state: ProvisioningUiState,
     onSsidChange: (String) -> Unit,
+    onTransportChange: (Boolean) -> Unit,
     onConnect: () -> Unit,
     onOpenMessages: () -> Unit,
 ) {
@@ -310,12 +325,22 @@ private fun IntroPage(
         item {
             Text("让设备联网", fontSize = 34.sp, lineHeight = 38.sp, fontWeight = FontWeight.Black, color = Ink)
             Text(
-                "先让 ESP32 进入配网模式，再由系统建立一条仅供设备通信的 Wi-Fi 连接。",
+                "先让 ESP32 进入配网模式，再选择蓝牙或设备热点，把家庭 Wi-Fi 配置发送给设备。",
                 color = Muted,
                 fontSize = 15.sp,
                 lineHeight = 22.sp,
                 modifier = Modifier.padding(top = 8.dp),
             )
+        }
+        item {
+            Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                OutlinedButton(onClick = { onTransportChange(true) }) {
+                    Text(if (state.useBluetooth) "✓ 蓝牙配网" else "蓝牙配网")
+                }
+                OutlinedButton(onClick = { onTransportChange(false) }) {
+                    Text(if (!state.useBluetooth) "✓ 热点配网" else "热点配网")
+                }
+            }
         }
         item {
             InstructionCard()
@@ -325,7 +350,7 @@ private fun IntroPage(
                 value = state.deviceSsid,
                 onValueChange = onSsidChange,
                 modifier = Modifier.fillMaxWidth(),
-                label = { Text("设备热点") },
+                label = { Text("设备名称") },
                 supportingText = { Text("格式：esp32-xxx") },
                 singleLine = true,
                 shape = RoundedCornerShape(14.dp),
@@ -338,10 +363,10 @@ private fun IntroPage(
                 shape = RoundedCornerShape(16.dp),
                 colors = ButtonDefaults.buttonColors(containerColor = Forest),
             ) {
-                Text("连接设备热点", fontWeight = FontWeight.Bold)
+                Text(if (state.useBluetooth) "通过蓝牙连接设备" else "连接设备热点", fontWeight = FontWeight.Bold)
             }
             Text(
-                "设备热点无需密码。Android 会显示系统 Wi-Fi 确认框；App 不会修改或保存你手机原来的网络。",
+                if (state.useBluetooth) "开启手机蓝牙并允许附近设备权限，无需连接设备热点。Android 10–11 还需开启定位。" else "设备热点无需密码。Android 会显示系统 Wi-Fi 确认框；App 不会修改或保存你手机原来的网络。",
                 color = Muted,
                 fontSize = 12.sp,
                 lineHeight = 17.sp,
@@ -367,7 +392,7 @@ private fun InstructionCard() {
             Text("板端准备", color = Color(0xFFAAD5B7), fontSize = 12.sp, fontWeight = FontWeight.Bold)
             InstructionRow("01", "长按 BOOT 键 5 秒")
             InstructionRow("02", "看到蓝色呼吸灯后松开")
-            InstructionRow("03", "确认热点名称以 esp32- 开头")
+            InstructionRow("03", "设备蓝牙与热点名称均为 esp32-xxx")
         }
     }
 }

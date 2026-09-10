@@ -5,6 +5,10 @@ import android.content.Context
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
 import com.sleepwell.provisioning.data.DeviceInfo
+import com.sleepwell.provisioning.data.EspBleConnector
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.runInterruptible
 import com.sleepwell.provisioning.data.Esp32Api
 import com.sleepwell.provisioning.data.EspWifiConnector
 import com.sleepwell.provisioning.data.GitHubActionsApi
@@ -40,6 +44,7 @@ enum class MessageDeliveryChannel {
 }
 
 data class ProvisioningUiState(
+    val useBluetooth: Boolean = true,
     val page: ProvisioningPage = ProvisioningPage.INTRO,
     val deviceSsid: String = "esp32-c9c",
     val deviceInfo: DeviceInfo? = null,
@@ -70,6 +75,8 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
         private const val MAX_RECENT_MESSAGES = 10
     }
 
+    private var bleConnector = EspBleConnector(application)
+    private var provisioningJob: Job? = null
     private val connector = EspWifiConnector(application)
     private val workerApi = WorkerApi(BuildConfig.WORKER_BASE_URL, BuildConfig.WORKER_API_TOKEN)
     private val githubActionsApi = GitHubActionsApi(
@@ -90,6 +97,10 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
         ProvisioningUiState(recentMessages = loadRecentMessages()),
     )
     val uiState: StateFlow<ProvisioningUiState> = _uiState.asStateFlow()
+
+    fun setUseBluetooth(value: Boolean) {
+        _uiState.update { it.copy(useBluetooth = value, errorMessage = null) }
+    }
 
     fun setDeviceSsid(value: String) {
         _uiState.update { it.copy(deviceSsid = value.trim(), errorMessage = null) }
@@ -206,29 +217,38 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
 
     fun permissionDenied() {
         _uiState.update {
-            it.copy(errorMessage = "需要“附近设备/Wi-Fi”权限才能请求连接 ESP32 热点")
+            it.copy(errorMessage = "需要附近设备权限；旧版 Android 还需要位置权限，请在系统设置中允许")
         }
     }
 
     fun connectToDevice() {
+        if (_uiState.value.page != ProvisioningPage.INTRO) return
         val current = _uiState.value
         if (!Regex("^esp32-[0-9a-fA-F]{3}$").matches(current.deviceSsid)) {
-            _uiState.update { it.copy(errorMessage = "设备热点名称格式应为 esp32-xxx") }
+            _uiState.update { it.copy(errorMessage = "设备名称格式应为 esp32-xxx") }
             return
         }
-        viewModelScope.launch {
+        provisioningJob = viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     page = ProvisioningPage.CONNECTING_DEVICE,
-                    statusText = "等待系统确认连接 ${current.deviceSsid}",
+                    statusText = if (current.useBluetooth) "正在通过蓝牙搜索 ${current.deviceSsid}" else "等待系统确认连接 ${current.deviceSsid}",
                     errorMessage = null,
                 )
             }
             runCatching {
-                val network = connector.connect(current.deviceSsid)
+                val newApi = if (current.useBluetooth) {
+                    // A cancelled IO operation may still be unwinding while the user
+                    // starts again. Give each attempt its own callbacks and queues.
+                    val session = EspBleConnector(getApplication())
+                    bleConnector = session
+                    runInterruptible(Dispatchers.IO) { session.connect(current.deviceSsid) }
+                    Esp32Api(ble = session)
+                } else {
+                    Esp32Api(connector.connect(current.deviceSsid))
+                }
                 _uiState.update { it.copy(statusText = "已连接设备，正在读取信息") }
-                val newApi = Esp32Api(network)
-                val info = withContext(Dispatchers.IO) { newApi.getDeviceInfo() }
+                val info = deviceRequest(newApi) { newApi.getDeviceInfo() }
                 api = newApi
                 token = info.provisioningToken
                 info
@@ -251,11 +271,14 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun cancelSwitchWifi() {
+        provisioningJob?.cancel()
+        bleConnector.disconnect()
         connector.disconnect()
         api = null
         token = ""
         _uiState.update {
             ProvisioningUiState(
+                useBluetooth = it.useBluetooth,
                 deviceSsid = it.deviceSsid,
                 statusText = "已取消切换 Wi-Fi",
                 recentMessages = it.recentMessages,
@@ -264,8 +287,9 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun scanNetworks() {
+        if (_uiState.value.isRefreshing) return
         val currentApi = api ?: return showMessage("尚未连接到 ESP32")
-        viewModelScope.launch {
+        provisioningJob = viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     page = ProvisioningPage.WIFI_LIST,
@@ -275,7 +299,7 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
                 )
             }
             runCatching {
-                withContext(Dispatchers.IO) { currentApi.scanWifi(token) }
+                deviceRequest(currentApi) { currentApi.scanWifi(token) }
             }.onSuccess { networks ->
                 _uiState.update {
                     it.copy(
@@ -289,6 +313,7 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun selectNetwork(network: WifiNetwork) {
+        if (_uiState.value.isRefreshing) return
         _uiState.update {
             it.copy(
                 selectedNetwork = network,
@@ -311,17 +336,18 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
             return showMessage("Wi-Fi 密码应为 8–63 个字符")
         }
 
-        viewModelScope.launch {
+        provisioningJob = viewModelScope.launch {
             _uiState.update {
                 it.copy(
                     selectedNetwork = null,
+                    routerPassword = "",
                     page = ProvisioningPage.CONNECTING_ROUTER,
                     statusText = "正在将 ${network.ssid} 发送给设备",
                     errorMessage = null,
                 )
             }
             runCatching {
-                withContext(Dispatchers.IO) {
+                deviceRequest(currentApi) {
                     currentApi.submitWifi(token, network.ssid, current.routerPassword)
                 }
                 pollConnectionStatus(currentApi, network.ssid)
@@ -329,14 +355,19 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
         }
     }
 
+    private suspend fun <T> deviceRequest(currentApi: Esp32Api, action: () -> T): T =
+        if (currentApi.usesBluetooth) runInterruptible(Dispatchers.IO, action)
+        else withContext(Dispatchers.IO) { action() }
+
     private suspend fun pollConnectionStatus(currentApi: Esp32Api, targetSsid: String) {
         repeat(22) { attempt ->
             delay(if (attempt == 0) 600 else 1_000)
             _uiState.update {
                 it.copy(statusText = "设备正在连接 $targetSsid · ${attempt + 1}s")
             }
-            val status = withContext(Dispatchers.IO) { currentApi.getWifiStatus(token) }
+            val status = deviceRequest(currentApi) { currentApi.getWifiStatus(token) }
             if (status.connected && status.state == "connected") {
+                bleConnector.disconnect()
                 connector.disconnect()
                 api = null
                 token = ""
@@ -360,19 +391,29 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
     }
 
     fun startOver() {
+        provisioningJob?.cancel()
+        bleConnector.disconnect()
         connector.disconnect()
         api = null
         token = ""
         val current = _uiState.value
         _uiState.value = ProvisioningUiState(
+            useBluetooth = current.useBluetooth,
             deviceSsid = current.deviceSsid,
             recentMessages = current.recentMessages,
         )
     }
 
     private fun showFailure(throwable: Throwable) {
+        if (throwable is CancellationException) throw throwable
+        if (api == null) {
+            bleConnector.disconnect()
+            connector.disconnect()
+        }
         val message = when (throwable) {
             is ProvisioningApiException -> translateError(throwable.code, throwable.message)
+            is java.net.SocketException -> "与设备热点的连接中断，请保持蓝色呼吸灯亮起，并重新连接设备热点"
+            is java.net.SocketTimeoutException -> "设备热点响应超时，请靠近设备后重试"
             is SecurityException -> "系统拒绝了网络请求：${throwable.message ?: "请检查附近设备权限"}"
             else -> throwable.message ?: "操作失败，请重试"
         }
@@ -381,6 +422,7 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
                 page = if (api == null) ProvisioningPage.INTRO else ProvisioningPage.WIFI_LIST,
                 isRefreshing = false,
                 statusText = "",
+                routerPassword = "",
                 errorMessage = message,
             )
         }
@@ -448,6 +490,8 @@ class ProvisioningViewModel(application: Application) : AndroidViewModel(applica
     }
 
     override fun onCleared() {
+        provisioningJob?.cancel()
+        bleConnector.disconnect()
         connector.disconnect()
         super.onCleared()
     }

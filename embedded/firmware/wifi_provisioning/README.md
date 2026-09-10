@@ -1,6 +1,21 @@
-# ESP32-S3 Wi-Fi Provisioning Firmware
+# ESP32-S3 Wi-Fi / BLE Provisioning Firmware
 
 适用于当前项目的 `YD-ESP32-23 / ESP32-S3-N16R8` 开发板。
+
+## 蓝牙配网（0.6.2）
+
+0.6.1 修复 NimBLE indication 同步等待误超时导致的首次连接断开，改为按真实异步确认推进分片。
+
+0.6.2 在手机通过 HTTP 读取设备信息、选择热点配网时暂停 BLE，下一次进入配网模式时恢复。保留原有同步 Wi-Fi 扫描流程，并记录扫描耗时和热点客户端数量。同步扫描期间主循环无法刷新呼吸灯，因此灯效会短暂停顿。
+
+2026-09-10 真机验证（App 0.4.2）：热点扫描耗时 3656 ms，返回 16 个网络，扫描前后均有 1 个热点客户端；随后收到配网信息、连接路由器成功并恢复 MQTT。本次验证通过，尚未完成多轮稳定性测试。
+
+长按 BOOT 5 秒后，同时开放 SoftAP 与 BLE，蓝牙名称与热点名称一致（例如 `esp32-c9c`）。
+Android App 首页选择“蓝牙配网”，无需切换手机 Wi-Fi，即可读取设备、扫描路由器、提交凭据并查询结果。
+短按 BOOT 或配网成功后，两种配网入口都会关闭；失败不会覆盖旧凭据。
+BLE 响应完整发送后才允许执行成功后的关闭动作。
+
+协议详见 [BLE_PROVISIONING.md](../../../docs/BLE_PROVISIONING.md)。
 
 ## 功能
 
@@ -179,5 +194,6 @@ MQTT 用户名和客户端 ID 均由 `esp32-<deviceId>` 生成，当前设备为
 
 - SoftAP 是无密码开放热点，修改类接口需要每次启动随机生成的 token。
 - 日志不会输出家庭 Wi-Fi 密码。
+- BLE 仅在手动开启的配网模式工作，使用同一会话 token；当前未启用 BLE 配对加密或应用层加密。
 - Wi-Fi 密码当前由 Arduino Preferences 保存到普通 NVS。
 - 正式量产前仍需评估 NVS Encryption、Flash Encryption 和 Secure Boot。

@@ -1,4 +1,7 @@
 #include <Arduino.h>
+#include <BLEDevice.h>
+#include <BLE2902.h>
+#include <atomic>
 #include <ArduinoJson.h>
 #include <DNSServer.h>
 #include <Preferences.h>
@@ -20,7 +23,7 @@
 #endif
 
 namespace Config {
-constexpr char kFirmwareVersion[] = "0.5.2";
+constexpr char kFirmwareVersion[] = "0.6.2";
 constexpr char kDeviceModel[] = "ESP32-S3-N16R8";
 constexpr char kApiPrefix[] = "/api/v1";
 constexpr char kPreferencesNamespace[] = "wifi-prov";
@@ -206,6 +209,11 @@ String jsonString(const JsonDocument &document) {
   return output;
 }
 
+bool bleRequestActive = false;
+String bleRequestToken;
+String bleRequestBody;
+String bleResponse;
+
 void addCommonHeaders() {
   server.sendHeader("Access-Control-Allow-Origin", "*");
   server.sendHeader("Access-Control-Allow-Headers", "Content-Type, X-Provisioning-Token");
@@ -214,6 +222,13 @@ void addCommonHeaders() {
 }
 
 void sendJson(int statusCode, const JsonDocument &document) {
+  if (bleRequestActive) {
+    JsonDocument envelope;
+    envelope["status"] = statusCode;
+    envelope["body"] = document.as<JsonVariantConst>();
+    bleResponse = jsonString(envelope) + "\n";
+    return;
+  }
   addCommonHeaders();
   server.send(statusCode, "application/json; charset=utf-8", jsonString(document));
 }
@@ -235,8 +250,8 @@ void sendError(int statusCode, const char *code, const char *message) {
 }
 
 bool requireProvisioningToken() {
-  if (!server.hasHeader("X-Provisioning-Token") ||
-      server.header("X-Provisioning-Token") != provisioningToken) {
+  const String token = bleRequestActive ? bleRequestToken : server.header("X-Provisioning-Token");
+  if (!provisioningModeActive || token.isEmpty() || token != provisioningToken) {
     sendError(401, "INVALID_PROVISIONING_TOKEN", "Missing or invalid provisioning token");
     return false;
   }
@@ -545,7 +560,15 @@ void handleOptions() {
   server.send(204, "text/plain", "");
 }
 
+void stopBleProvisioning();
+
 void handleDeviceInfo() {
+  // Once the phone selects HTTP/SoftAP, leave the radio to Wi-Fi. BLE starts
+  // again on the next BOOT provisioning session.
+  if (!bleRequestActive && provisioningModeActive) {
+    stopBleProvisioning();
+    Serial.println("[ap] HTTP provisioning selected; BLE paused");
+  }
   JsonDocument document;
   document["deviceModel"] = Config::kDeviceModel;
   document["deviceId"] = deviceId;
@@ -571,7 +594,13 @@ void handleWifiScan() {
     return;
   }
 
+  const uint32_t scanStartedAt = millis();
+  Serial.printf("[wifi] Scan started via %s; AP clients: %u\n",
+                bleRequestActive ? "BLE" : "HTTP", WiFi.softAPgetStationNum());
   const int networkCount = WiFi.scanNetworks(false, true);
+  Serial.printf("[wifi] Scan finished in %lu ms; result: %d; AP clients: %u\n",
+                static_cast<unsigned long>(millis() - scanStartedAt), networkCount,
+                WiFi.softAPgetStationNum());
   if (networkCount < 0) {
     sendError(500, "WIFI_SCAN_FAILED", "Unable to scan nearby Wi-Fi networks");
     return;
@@ -623,7 +652,7 @@ void handleWifiConfig() {
     return;
   }
 
-  const String body = server.arg("plain");
+  const String body = bleRequestActive ? bleRequestBody : server.arg("plain");
   if (body.isEmpty() || body.length() > Config::kMaxRequestBodyBytes) {
     sendError(400, "INVALID_REQUEST_BODY", "Request body is empty or too large");
     return;
@@ -749,6 +778,8 @@ void configureHttpRoutes() {
   });
 }
 
+#include "ble_provisioning.h"
+
 void startProvisioningMode() {
   if (provisioningModeActive) {
     provisioningState = ProvisioningState::kAwaitingConfig;
@@ -796,6 +827,7 @@ void startProvisioningMode() {
   server.begin();
   httpServerRunning = true;
   provisioningModeActive = true;
+  startBleProvisioning();
   provisioningState = ProvisioningState::kAwaitingConfig;
 
   Serial.println("[ap] Provisioning mode started");
@@ -809,6 +841,7 @@ void stopProvisioningMode() {
   if (!provisioningModeActive) {
     return;
   }
+  stopBleProvisioning();
   dnsServer.stop();
   server.stop();
   httpServerRunning = false;
@@ -1164,6 +1197,9 @@ void processMqtt() {
     return;
   }
 
+  // TLS handshakes/diagnostics can block for seconds; finish local provisioning first.
+  if (!mqttClient.connected() && provisioningModeActive) return;
+
   if (!mqttClient.connected()) {
     if (lastMqttReconnectAt == 0 || now - lastMqttReconnectAt >= MqttConfig::kReconnectIntervalMs) {
       lastMqttReconnectAt = now;
@@ -1237,6 +1273,7 @@ void setup() {
 
 void loop() {
   processBootButton();
+  processBleProvisioning();
   processConnectionState();
   processMqtt();
   processProvisioningLed();
@@ -1251,7 +1288,7 @@ void loop() {
     server.handleClient();
   }
 
-  if (apShutdownAt != 0 && static_cast<int32_t>(millis() - apShutdownAt) >= 0) {
+  if (bleResponse.isEmpty() && apShutdownAt != 0 && static_cast<int32_t>(millis() - apShutdownAt) >= 0) {
     stopProvisioningMode();
   }
   if (rebootAt != 0 && static_cast<int32_t>(millis() - rebootAt) >= 0) {

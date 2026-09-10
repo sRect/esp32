@@ -1,13 +1,17 @@
 package com.sleepwell.provisioning.data
 
 import android.net.Network
+import android.util.Log
 import org.json.JSONObject
 import java.net.HttpURLConnection
 import java.net.URL
 
 class Esp32Api(
-    private val network: Network,
+    private val network: Network? = null,
+    private val ble: EspBleConnector? = null,
 ) {
+    val usesBluetooth: Boolean get() = ble != null
+
     companion object {
         private const val BASE_URL = "http://192.168.4.1/api/v1"
         private const val CONNECT_TIMEOUT_MS = 5_000
@@ -80,7 +84,9 @@ class Esp32Api(
         token: String? = null,
         body: JSONObject? = null,
     ): JSONObject {
-        val connection = network.openConnection(URL(BASE_URL + path)) as HttpURLConnection
+        ble?.let { return it.request(method, path, token, body) }
+        Log.i("EspWifiProvisioning", "Request $method $path network=$network")
+        val connection = requireNotNull(network).openConnection(URL(BASE_URL + path)) as HttpURLConnection
         try {
             connection.requestMethod = method
             connection.connectTimeout = CONNECT_TIMEOUT_MS
@@ -96,6 +102,7 @@ class Esp32Api(
             }
 
             val statusCode = connection.responseCode
+            Log.i("EspWifiProvisioning", "Response $path status=$statusCode")
             val stream = if (statusCode in 200..299) connection.inputStream else connection.errorStream
             val responseText = stream?.bufferedReader(Charsets.UTF_8)?.use { it.readText() }.orEmpty()
             val response = if (responseText.isBlank()) JSONObject() else JSONObject(responseText)
@@ -108,6 +115,9 @@ class Esp32Api(
                 )
             }
             return response
+        } catch (error: java.io.IOException) {
+            Log.w("EspWifiProvisioning", "Request $path failed: ${error.javaClass.simpleName}: ${error.message}")
+            throw error
         } finally {
             connection.disconnect()
         }

@@ -1,5 +1,7 @@
 # ESP32-S3：从手机配网到云端 MQTT 消息下发
 
+当前版本：固件 **0.6.2**、Android App **0.4.2**。长按 BOOT 5 秒后，App 可选择蓝牙或热点配网；蓝牙方式无需切换手机 Wi-Fi。0.6.1 修复首次蓝牙响应误超时断连，0.6.2 在选择热点配网后暂停蓝牙，处理热点扫描阶段断连问题。协议详见 [蓝牙配网](docs/BLE_PROVISIONING.md)，最新真机结果见本文“测试”。
+
 > 一个覆盖嵌入式固件、Android App、Cloudflare Worker、GitHub Actions 和 EMQX Cloud
 > 的端到端 IoT 原型。
 
@@ -10,7 +12,7 @@
 1. 一块刚上电、尚未连接互联网的 ESP32-S3，如何安全、可恢复地拿到家庭 Wi-Fi 配置？
 2. 设备联网后，手机如何不再依赖局域网，经过云端向指定设备发送消息？
 
-项目目前已经跑通完整链路：Android 手机连接 ESP32 临时热点，将 2.4GHz Wi-Fi
+项目目前已经跑通完整链路：Android 手机通过 BLE 或 ESP32 临时热点，将 2.4GHz Wi-Fi
 凭据交给设备；设备验证联网成功后才持久化配置，随后通过 TLS 连接 EMQX。手机还可以
 默认调用 Cloudflare Worker，也可以手动切换到 GitHub Actions 备用路径。两条路径最终都
 通过 EMQX 将显示命令发布到 MQTT；ESP32 收到后在 OLED 显示，并通过串口、RGB 指示灯
@@ -22,7 +24,9 @@ OLED 和高电平触发有源蜂鸣器。固件支持常用中英文自动换行
 
 ## 项目能力
 
-- 长按 BOOT 5 秒进入 SoftAP 配网，短按可退出配网模式。
+- 长按 BOOT 5 秒同时开启 BLE 和 SoftAP 配网入口，短按可退出配网模式。
+- Android 可选择蓝牙配网，通过 GATT 传递设备信息、Wi-Fi 扫描结果、配置和状态，无需切换手机 Wi-Fi。
+- 手机选择热点配网后暂停 BLE，退出并重新进入配网模式后恢复蓝牙入口。
 - Android 10 及以上通过系统 Wi-Fi 弹窗连接 `esp32-xxx` 临时热点。
 - ESP32 提供本地 HTTP JSON API，负责设备信息、Wi-Fi 扫描、配置和状态查询。
 - 每次启动配网模式都会生成随机 `X-Provisioning-Token`，保护修改类接口。
@@ -118,14 +122,14 @@ OLED                     YD-ESP32-23
 | 模块 | 运行位置 | 职责 |
 |---|---|---|
 | `android-app` | Android 手机 | 引导配网、调用本地设备 API、发送云端消息 |
-| `embedded` | ESP32-S3 | SoftAP、HTTP API、NVS、Wi-Fi 状态机、MQTT 客户端 |
+| `embedded` | ESP32-S3 | BLE GATT、SoftAP、HTTP API、NVS、Wi-Fi 状态机、MQTT 客户端 |
 | `serverless` | Cloudflare Workers | 公网 API、鉴权、参数校验、调用 EMQX HTTP API |
 | `.github/workflows` | GitHub Actions | 备用触发入口、参数校验、调用 EMQX HTTP API |
 | `mqtt` / EMQX | MQTT Broker | 将云端命令路由到指定设备，并承载 ACK 与在线状态 |
 
 ## 整体架构
 
-配网和消息发送是两条独立链路。配网发生在手机与 ESP32 组成的临时局域网内；消息发送
+配网和消息发送是两条独立链路。配网通过手机与 ESP32 之间的 BLE 或临时热点完成；消息发送
 发生在公网，要求 ESP32 已经连上家庭 Wi-Fi。
 
 ```mermaid
@@ -136,6 +140,8 @@ flowchart LR
         A <-->|"WifiNetworkSpecifier"| AP["ESP32 SoftAP"]
         A <-->|"HTTP JSON + 临时 Token"| API["ESP32 配网 API"]
         AP --- API
+        A <-->|"GATT JSON + 临时 Token"| BLE["ESP32 BLE 配网"]
+        BLE --- API
         API -->|"联网成功后写入 NVS"| ESP["ESP32-S3"]
     end
 
@@ -165,7 +171,7 @@ flowchart LR
 3. 生成 16 字节随机配网令牌。
 4. 以 `WIFI_AP_STA` 模式启动开放热点。
 5. 将 SoftAP 固定为 `192.168.4.1`，启动 DNS 和 HTTP 服务。
-6. 用蓝色呼吸灯告诉用户设备正在等待配网。
+6. 启动同名 BLE 广播，用蓝色呼吸灯告诉用户设备正在等待配网。
 
 固件中的核心逻辑如下（节选）：
 
@@ -190,7 +196,15 @@ void startProvisioningMode() {
 ESP32-S3 只有一套 2.4GHz 无线电。设备已经连接家庭 Wi-Fi 时再次打开 AP，AP 与 STA
 需要共享信道，因此固件优先沿用当前 STA 信道，避免切换 Wi-Fi 时出现底层配置失败。
 
-### 2. Android 请求连接设备热点
+### 2. Android 选择蓝牙或热点配网
+
+选择“蓝牙配网”时，开启手机蓝牙并授予权限，连接 `esp32-xxx`。App 通过 GATT
+读取设备信息，再扫描路由器、提交密码和查询结果；已有配置时先确认切换。BLE 使用
+JSON 分片和 indication 确认，复用热点配网的业务处理逻辑。
+
+选择“热点配网”时，按下述系统弹窗流程连接。固件收到 HTTP `/device` 请求后暂停
+BLE 广播及连接，避免两种配网传输同时工作；若要改用蓝牙，短按 BOOT 退出后再长按
+5 秒重新进入配网模式。下面的 HTTP 示例说明热点路径。
 
 Android 10 之后，应用不能静默切换 Wi-Fi。App 使用 `WifiNetworkSpecifier` 描述目标
 热点，再由系统弹窗让用户确认。这个确认过程不能绕过，也是实际配网体验的一部分。
@@ -228,7 +242,7 @@ GET http://192.168.4.1/api/v1/device
 {
   "deviceModel": "ESP32-S3-N16R8",
   "deviceId": "7CE8B1B1FC9C",
-  "firmwareVersion": "0.5.1",
+  "firmwareVersion": "0.6.2",
   "provisioningState": "awaiting_config",
   "hasProvisionedBefore": true,
   "apSsid": "esp32-c9c",
@@ -250,6 +264,9 @@ X-Provisioning-Token: <token>
 App 调用 `/wifi/scan`，ESP32 扫描附近网络并返回 SSID、RSSI、信道和加密类型。App
 去重后按信号强度排序，只让用户选择实际可见的网络。ESP32-S3 仅支持 2.4GHz，因此
 家庭路由器必须开启 2.4GHz 频段。
+
+当前扫描仍为同步调用，期间主循环暂停刷新蓝色呼吸灯，扫描结束后灯效恢复。单凭灯效
+短暂停顿不能判断设备重启；可通过串口启动日志、扫描耗时及热点客户端数量判断。
 
 用户输入密码后，App 提交：
 
@@ -620,6 +637,10 @@ Wi-Fi 配网必须使用真机验证：模拟器无法可靠测试附近 Wi-Fi�
 热点的路由行为。Android 13 及以上需要“附近的 Wi-Fi 设备”权限；Android 10–12 使用
 相关 Wi-Fi API 时仍需要位置权限。
 
+蓝牙配网同样需要真机：Android 12 及以上需要蓝牙扫描与连接权限，Android 10–11
+需要位置权限并开启定位。App 0.4.2 的热点 HTTP 请求使用原有 `withContext(IO)` 执行方式，
+仅 BLE 阻塞调用使用可中断执行。
+
 ## 安全设计与当前边界
 
 这个项目已经把“本地配网凭据”和“公网控制凭据”分开处理，但当前仍是单设备原型，不能
@@ -628,7 +649,7 @@ Wi-Fi 配网必须使用真机验证：模拟器无法可靠测试附近 Wi-Fi�
 | 风险点 | 当前措施 | 量产建议 |
 |---|---|---|
 | 开放 SoftAP 被旁观者访问 | 修改接口要求每次启动随机 Token | 使用二维码携带设备秘密，增加应用层加密和配网超时 |
-| 家庭 Wi-Fi 密码泄露 | 只在本地热点传输；不打印、不在 App 持久化 | 启用加密配网协议与 NVS Encryption |
+| 家庭 Wi-Fi 密码泄露 | 只通过本地 BLE 或热点传输；不打印、不在 App 持久化 | 启用加密配网协议与 NVS Encryption |
 | 错误配置覆盖可用凭据 | 联网并取得 IP 后才写 NVS | 增加双分区配置、回滚计数和恢复策略 |
 | Worker 被未授权调用 | Bearer Token + 设备 ID + 输入校验 | 用户登录、短期令牌、设备归属和限流 |
 | Token 被逆向 APK 获取 | Token 仅存本机配置但会编译进 APK | 不在客户端保存长期共享秘密 |
@@ -638,7 +659,7 @@ Wi-Fi 配网必须使用真机验证：模拟器无法可靠测试附近 Wi-Fi�
 | 固件被篡改 | 当前尚未启用硬件安全能力 | Secure Boot、Flash Encryption、签名 OTA |
 
 特别需要注意：SoftAP 虽然有临时 Token，但目前仍是开放热点，而且本地 HTTP 是明文。
-这足以支持受控环境中的原型验证，不适合在不可信公共环境直接量产部署。
+BLE 目前也未启用配对加密或应用层加密。这足以支持受控环境中的原型验证，不适合在不可信公共环境直接量产部署。
 
 ## 故障排查
 
@@ -655,6 +676,14 @@ Wi-Fi 配网必须使用真机验证：模拟器无法可靠测试附近 Wi-Fi�
 - 不要因为“无互联网”提示而切断热点。
 - 确认请求通过返回的 `Network` 执行，而不是普通 `URL.openConnection()`。
 - 检查地址是否仍为 `http://192.168.4.1`。
+
+### 热点配网第 2 步断连，蓝色呼吸灯短暂停顿
+
+- 曾出现 `Software caused connection abort` 或“与设备的连接中断”，且设备信息读取成功、扫描阶段断开。
+- 固件 0.6.2 在 HTTP 读取设备信息时暂停 BLE，保留原有 Wi-Fi 扫描流程；配套 App 为 0.4.2。
+- 串口应出现 `[ap] HTTP provisioning selected; BLE paused`，随后打印扫描开始、耗时、结果数量和热点客户端数量。
+- 同步扫描会暂时阻塞灯效刷新。若出现新的启动横幅或崩溃输出，应另查重启原因，不能仅凭灯效判断。
+- 本次真机扫描及后续联网已通过，仍需多轮稳定性回归。
 
 ### ESP32 连不上家庭 Wi-Fi
 
@@ -688,6 +717,17 @@ Wi-Fi 配网必须使用真机验证：模拟器无法可靠测试附近 Wi-Fi�
 - 确认 Worker 发布主题与设备订阅主题完全一致。
 
 ## 测试
+
+### 本次更新验证（2026-09-10）
+
+- 固件 0.6.2 编译通过并已烧录，写入哈希校验通过，串口确认运行版本。
+- Android App 0.4.2 已安装到小米 10；构建、4 项 BLE 分包单元测试通过，Lint 无错误。
+- 蓝牙配网在 0.6.1 修复后，用户反馈操作成功；完整异常场景仍需回归。
+- 热点配网实测：扫描耗时 3656 ms，返回 16 个 Wi-Fi，扫描前后热点客户端数量均为 1。
+- 随后设备收到配网信息、取得路由器 IP，退出配网并恢复 MQTT TLS 连接及订阅；串口还确认收到显示命令。
+- 以上为本次真机结果，尚未完成多轮稳定性、不同手机及路由器兼容性测试。
+
+### 自动测试与后续回归
 
 Worker 使用 Node.js 内置测试运行器覆盖以下场景：
 
